@@ -79,6 +79,38 @@ The test scripts let you safely validate the cleanup against a **real History Da
 6. Your HDB is back to its original state
 ```
 
+### Quick Verification Queries (per table)
+
+Run these after `cleanup_history.sql` to confirm old test rows were purged. Only rows newer than 2 years should remain.
+
+```sql
+-- DialogHistory
+SELECT COUNT(*) AS Remaining FROM DialogHistory WHERE XUserInserted LIKE 'TEST_CLEANUP_%' AND XDateInserted < DATEADD(YEAR, -2, GETDATE());
+
+-- DialogJournal
+SELECT COUNT(*) AS Remaining FROM DialogJournal WHERE XUserInserted LIKE 'TEST_CLEANUP_%' AND XDateInserted < DATEADD(YEAR, -2, GETDATE());
+
+-- DialogJournalDetail
+SELECT COUNT(*) AS Remaining FROM DialogJournalDetail WHERE ColumnName LIKE 'TEST_CLEANUP_%' AND XDateInserted < DATEADD(YEAR, -2, GETDATE());
+
+-- JobHistory
+SELECT COUNT(*) AS Remaining FROM JobHistory WHERE XUserInserted LIKE 'TEST_CLEANUP_%' AND XDateInserted < DATEADD(YEAR, -2, GETDATE());
+
+-- PersonWantsOrg (uses XDateUpdated)
+SELECT COUNT(*) AS Remaining FROM PersonWantsOrg WHERE XUserInserted LIKE 'TEST_CLEANUP_%' AND XDateUpdated < DATEADD(YEAR, -2, GETDATE());
+
+-- QBMDBQueueHistory
+SELECT COUNT(*) AS Remaining FROM QBMDBQueueHistory WHERE SlotName LIKE 'TEST_CLEANUP_%' AND XDateInserted < DATEADD(YEAR, -2, GETDATE());
+
+-- QBMProcessHistory
+SELECT COUNT(*) AS Remaining FROM QBMProcessHistory WHERE ProcessName LIKE 'TEST_CLEANUP_%' AND XDateInserted < DATEADD(YEAR, -2, GETDATE());
+
+-- QBMDBQueueSlotHistory
+SELECT COUNT(*) AS Remaining FROM QBMDBQueueSlotHistory WHERE SlotName LIKE 'TEST_CLEANUP_%' AND XDateInserted < DATEADD(YEAR, -2, GETDATE());
+```
+
+All queries should return **0** after a successful cleanup. Any non-zero result means the cleanup missed rows in that table.
+
 > **Note:** The cleanup script purges by date, not by prefix — so it will also delete any real data older than 2 years. If you only want to test against the prefixed data, run the cleanup on an HDB that has no real data you need to keep, or adjust the retention period.
 
 ## ⚠️ Important
