@@ -101,28 +101,19 @@ foreach ($db in $Database) {
     $dbTotal = 0
 
     # Discover date columns for all tables in this HDB
-    $discoverQuery = @"
-SELECT t.name AS TableName, c.name AS DateColumn
-FROM sys.tables t
-CROSS APPLY (
-    SELECT TOP 1 c.name
-    FROM sys.columns c
-    INNER JOIN sys.types ty ON c.user_type_id = ty.user_type_id
-    WHERE c.object_id = t.object_id
-      AND ty.name IN ('datetime', 'datetime2', 'smalldatetime', 'date')
-    ORDER BY
-        CASE c.name
-            WHEN 'XDateInserted' THEN 1
-            WHEN 'XDateUpdated'  THEN 2
-            WHEN 'StartDate'     THEN 3
-            WHEN 'EndDate'       THEN 4
-            ELSE 5
-        END,
-        c.column_id
-) c
-WHERE t.name NOT IN ('SourceColumn', 'SourceDatabase', 'SourceTable')
-ORDER BY t.name
-"@
+    $discoverQuery = "SELECT t.name AS TableName, c.name AS DateColumn " +
+        "FROM sys.tables t " +
+        "CROSS APPLY ( " +
+        "SELECT TOP 1 c.name FROM sys.columns c " +
+        "INNER JOIN sys.types ty ON c.user_type_id = ty.user_type_id " +
+        "WHERE c.object_id = t.object_id " +
+        "AND ty.name IN ('datetime','datetime2','smalldatetime','date') " +
+        "ORDER BY CASE c.name " +
+        "WHEN 'XDateInserted' THEN 1 WHEN 'XDateUpdated' THEN 2 " +
+        "WHEN 'StartDate' THEN 3 WHEN 'EndDate' THEN 4 ELSE 5 END, " +
+        "c.column_id) c " +
+        "WHERE t.name NOT IN ('SourceColumn','SourceDatabase','SourceTable') " +
+        "ORDER BY t.name"
 
     try {
         $tableInfo = Invoke-Sqlcmd @connParams -Database $db -Query $discoverQuery
