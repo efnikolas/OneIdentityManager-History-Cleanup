@@ -10,6 +10,7 @@ Scripts to purge history/journal data older than 2 years from One Identity Manag
 |------|-------------|
 | `cleanup_history.sql` | Pure SQL script — run directly in SSMS against a single HDB |
 | `Invoke-OIMHistoryCleanup.ps1` | PowerShell wrapper with multi-HDB support, logging, batching, and dry-run |
+| `create_test_data.sql` | Creates a `TestOneIMHDB` database with bulk test data for validation |
 
 ## Tables Cleaned
 
