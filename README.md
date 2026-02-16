@@ -12,6 +12,7 @@ Scripts to purge archived data older than 2 years from One Identity Manager **Hi
 |------|-------------|
 | `cleanup_history.sql` | Main SQL cleanup script — run in SSMS against a single HDB |
 | `Invoke-OIMHistoryCleanup.ps1` | PowerShell wrapper — multi-HDB support, logging, batching, dry-run |
+| `audit_hdb_age.sql` | **Read-only** audit — date ranges, purge counts, year-by-year breakdown, oldest records |
 | `discover_hdb_schema.sql` | Schema discovery — inspect tables, columns, FKs, row counts, sample data |
 | `create_test_data.sql` | Inserts `TEST_CLEANUP_` prefixed test rows into an HDB for safe testing |
 | `remove_test_data.sql` | Removes all `TEST_CLEANUP_` test rows to restore the HDB |
@@ -105,6 +106,22 @@ Run `discover_hdb_schema.sql` to inspect an HDB before cleanup:
 2. Change USE [OneIMHDB] to your HDB
 3. Run — outputs tables, row counts, sizes, FKs, date columns, and sample data
 ```
+
+### Auditing — Check What Will Be Purged
+
+Run `audit_hdb_age.sql` **before** cleanup to verify which data is older than 2 years:
+
+```
+1. Open audit_hdb_age.sql in SSMS
+2. Change USE [OneIMHDB] to your HDB
+3. Run — completely read-only, no data is modified
+```
+
+The audit shows three sections:
+
+1. **Per-table summary** — oldest record, newest record, total rows, rows to purge, rows to keep, purge percentage
+2. **Year-by-year breakdown** — row counts per year with PURGE / PARTIAL / KEEP labels so you can see exactly which years will be affected
+3. **Oldest 5 records** — spot-check the actual oldest rows in each table to confirm they're genuinely old data
 
 ## Testing with Real HDBs
 
