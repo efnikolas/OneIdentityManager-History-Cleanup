@@ -13,6 +13,12 @@
 #
 #   # Multiple HDBs:
 #   .\Invoke-OIMHistoryCleanup.ps1 -SqlServer "myserver" -Database "OneIMHDB","OneIMHDB2","OneIMHDB3" -WhatIf
+#
+#   # With encrypted connection (SQL Server requires SSL):
+#   .\Invoke-OIMHistoryCleanup.ps1 -SqlServer "myserver" -Database "OneIMHDB" -Encrypt -WhatIf
+#
+#   # Encrypted but skip certificate validation (self-signed cert):
+#   .\Invoke-OIMHistoryCleanup.ps1 -SqlServer "myserver" -Database "OneIMHDB" -Encrypt -TrustServerCertificate -WhatIf
 # ============================================================
 
 param(
@@ -26,12 +32,21 @@ param(
 
     [int]$BatchSize = 10000,
 
+    [switch]$Encrypt,
+
+    [switch]$TrustServerCertificate,
+
     [switch]$WhatIf
 )
 
 $CutoffDate = (Get-Date).AddYears(-$RetentionYears)
 $cutoffStr  = $CutoffDate.ToString("yyyy-MM-dd")
 $LogFile    = Join-Path $PSScriptRoot "cleanup_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+
+# Build common connection parameters (splatted into every Invoke-Sqlcmd call)
+$connParams = @{ ServerInstance = $SqlServer; ErrorAction = 'Stop' }
+if ($Encrypt)                { $connParams['Encrypt'] = 'Mandatory' }
+if ($TrustServerCertificate) { $connParams['TrustServerCertificate'] = $true }
 
 function Write-Log {
     param([string]$Message, [string]$Color = "White")
@@ -72,6 +87,8 @@ Write-Log "Server:      $SqlServer"
 Write-Log "Databases:   $($Database -join ', ')"
 Write-Log "Cutoff:      $CutoffDate (retain last $RetentionYears years)"
 Write-Log "BatchSize:   $BatchSize"
+Write-Log "Encrypt:     $Encrypt"
+Write-Log "TrustCert:   $TrustServerCertificate"
 Write-Log "WhatIf:      $WhatIf"
 Write-Log "Log File:    $LogFile"
 Write-Log "================================================" "Cyan"
@@ -111,7 +128,7 @@ ORDER BY t.name
 "@
 
     try {
-        $tableInfo = Invoke-Sqlcmd -ServerInstance $SqlServer -Database $db -Query $discoverQuery -ErrorAction Stop
+        $tableInfo = Invoke-Sqlcmd @connParams -Database $db -Query $discoverQuery
     }
     catch {
         Write-Log "  ERROR discovering tables: $($_.Exception.Message)" "Red"
@@ -132,7 +149,7 @@ ORDER BY t.name
         $col = $row.DateColumn
         try {
             $countQuery = "SELECT COUNT(*) AS Total, SUM(CASE WHEN [$col] < '$cutoffStr' THEN 1 ELSE 0 END) AS ToPurge FROM [$tbl]"
-            $result = Invoke-Sqlcmd -ServerInstance $SqlServer -Database $db -Query $countQuery -ErrorAction Stop
+            $result = Invoke-Sqlcmd @connParams -Database $db -Query $countQuery
             Write-Log "    $tbl : $($result.Total) total, $($result.ToPurge) to purge (by $col)" "Yellow"
         }
         catch {
@@ -162,7 +179,7 @@ ORDER BY t.name
             $totalDeleted = 0
             do {
                 $deleteQuery = "DELETE TOP ($BatchSize) FROM [$tbl] WHERE [$col] < '$cutoffStr'; SELECT @@ROWCOUNT AS Deleted;"
-                $delResult = Invoke-Sqlcmd -ServerInstance $SqlServer -Database $db -Query $deleteQuery -ErrorAction Stop
+                $delResult = Invoke-Sqlcmd @connParams -Database $db -Query $deleteQuery
                 $deleted = $delResult.Deleted
                 $totalDeleted += $deleted
                 if ($deleted -gt 0) {
@@ -188,7 +205,7 @@ ORDER BY t.name
         Write-Log "" "White"
         Write-Log "  Updating statistics for $db..." "Cyan"
         try {
-            Invoke-Sqlcmd -ServerInstance $SqlServer -Database $db -Query "EXEC sp_updatestats" -ErrorAction Stop
+            Invoke-Sqlcmd @connParams -Database $db -Query "EXEC sp_updatestats"
             Write-Log "  OK Statistics updated" "Green"
         }
         catch {
