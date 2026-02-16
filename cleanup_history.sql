@@ -63,24 +63,43 @@ DECLARE @SQL         NVARCHAR(MAX)
 DECLARE @RowCount    BIGINT
 DECLARE @PurgeCount  BIGINT
 
--- Tables to clean (everything except Source* metadata)
+-- Tables to clean (everything except Source* metadata and non-HDB tables)
 DECLARE @Tables TABLE (
     TableName  NVARCHAR(256),
     DateColumn NVARCHAR(256)
 )
 
+-- FK-join delete definitions for tables that have NO date column.
+-- These are purged by joining to their parent table's date column.
+DECLARE @FKJoinDeletes TABLE (
+    ChildTable    NVARCHAR(256),
+    ParentTable   NVARCHAR(256),
+    ChildFK       NVARCHAR(256),
+    ParentPK      NVARCHAR(256),
+    ParentDateCol NVARCHAR(256)  -- resolved below
+)
+INSERT INTO @FKJoinDeletes (ChildTable, ParentTable, ChildFK, ParentPK) VALUES
+    ('WatchProperty',       'WatchOperation',  'UID_DialogWatchOperation', 'UID_DialogWatchOperation'),
+    ('ProcessSubstitute',   'ProcessInfo',     'UID_ProcessInfoNew',       'UID_ProcessInfo'),
+    ('RawWatchProperty',    'RawWatchOperation','UID_DialogWatchOperation', 'UID_DialogWatchOperation'),
+    ('RawProcessSubstitute','RawProcess',       'GenProcIDNew',             'GenProcID')
+
 -- Discover date columns for each cleanable table
 DECLARE disco_cur CURSOR LOCAL FAST_FORWARD FOR
     SELECT t.name
     FROM sys.tables t
-    WHERE t.name NOT IN ('SourceColumn', 'SourceDatabase', 'SourceTable')
+    WHERE t.name NOT IN ('SourceColumn', 'SourceDatabase', 'SourceTable',
+                          'nsecauth', 'nsecimport', 'sysdiagrams')
     ORDER BY t.name
 
 OPEN disco_cur
 FETCH NEXT FROM disco_cur INTO @TableName
 WHILE @@FETCH_STATUS = 0
 BEGIN
-    -- Find the best date column (prefer XDateInserted, then others)
+    -- Find the best date column using OIM HDB-specific priority:
+    --   OperationDate (WatchOperation), FirstDate (ProcessGroup/Info/HistoryChain),
+    --   XDateInserted (Raw*), ThisDate (ProcessChain/Step), StartAt (HistoryJob/RawJobHistory),
+    --   ExportDate (RawProcessGroup), then any other datetime column.
     SET @DateCol = NULL
 
     SELECT TOP 1 @DateCol = c.name
@@ -90,16 +109,21 @@ BEGIN
       AND ty.name IN ('datetime', 'datetime2', 'smalldatetime', 'date')
     ORDER BY
         CASE c.name
-            WHEN 'XDateInserted' THEN 1
-            WHEN 'XDateUpdated'  THEN 2
-            WHEN 'StartDate'     THEN 3
-            WHEN 'EndDate'       THEN 4
-            ELSE 5
+            WHEN 'OperationDate'  THEN 1
+            WHEN 'FirstDate'      THEN 2
+            WHEN 'XDateInserted'  THEN 3
+            WHEN 'ThisDate'       THEN 4
+            WHEN 'StartAt'        THEN 5
+            WHEN 'ExportDate'     THEN 6
+            WHEN 'XDateUpdated'   THEN 7
+            ELSE 10
         END,
         c.column_id
 
     IF @DateCol IS NOT NULL
         INSERT INTO @Tables (TableName, DateColumn) VALUES (@TableName, @DateCol)
+    ELSE IF EXISTS (SELECT 1 FROM @FKJoinDeletes WHERE ChildTable = @TableName)
+        PRINT '  INFO ' + @TableName + ' has no date column — will purge via FK join'
     ELSE
         PRINT '  SKIP ' + @TableName + ' (no date column found)'
 
@@ -108,7 +132,13 @@ END
 CLOSE disco_cur
 DEALLOCATE disco_cur
 
--- Show pre-flight counts
+-- Resolve parent date columns for FK-join tables
+UPDATE fk
+SET fk.ParentDateCol = t.DateColumn
+FROM @FKJoinDeletes fk
+INNER JOIN @Tables t ON fk.ParentTable = t.TableName
+
+-- Show pre-flight counts — tables with their own date column
 DECLARE preflight_cur CURSOR LOCAL FAST_FORWARD FOR
     SELECT TableName, DateColumn FROM @Tables ORDER BY TableName
 
@@ -127,6 +157,37 @@ BEGIN
 END
 CLOSE preflight_cur
 DEALLOCATE preflight_cur
+
+-- Show pre-flight counts — FK-joined tables (no date column)
+DECLARE @FKChild   NVARCHAR(256)
+DECLARE @FKParent  NVARCHAR(256)
+DECLARE @FKChildCol NVARCHAR(256)
+DECLARE @FKParentCol NVARCHAR(256)
+DECLARE @FKDateCol  NVARCHAR(256)
+
+DECLARE fk_pre CURSOR LOCAL FAST_FORWARD FOR
+    SELECT ChildTable, ParentTable, ChildFK, ParentPK, ParentDateCol
+    FROM @FKJoinDeletes WHERE ParentDateCol IS NOT NULL ORDER BY ChildTable
+
+OPEN fk_pre
+FETCH NEXT FROM fk_pre INTO @FKChild, @FKParent, @FKChildCol, @FKParentCol, @FKDateCol
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    IF OBJECT_ID(@FKChild, 'U') IS NOT NULL
+    BEGIN
+        SET @SQL = N'SELECT @total = (SELECT COUNT(*) FROM [' + @FKChild + N']), ' +
+            N'@old = (SELECT COUNT(*) FROM [' + @FKChild + N'] child ' +
+            N'INNER JOIN [' + @FKParent + N'] parent ON child.[' + @FKChildCol + N'] = parent.[' + @FKParentCol + N'] ' +
+            N'WHERE parent.[' + @FKDateCol + N'] < @cutoff)'
+        EXEC sp_executesql @SQL,
+            N'@cutoff DATETIME, @total BIGINT OUTPUT, @old BIGINT OUTPUT',
+            @CutoffDate, @RowCount OUTPUT, @PurgeCount OUTPUT
+        PRINT '  ' + @FKChild + ': ' + CAST(@RowCount AS VARCHAR) + ' total, ' + CAST(@PurgeCount AS VARCHAR) + ' to purge (via ' + @FKParent + '.' + @FKDateCol + ')'
+    END
+    FETCH NEXT FROM fk_pre INTO @FKChild, @FKParent, @FKChildCol, @FKParentCol, @FKDateCol
+END
+CLOSE fk_pre
+DEALLOCATE fk_pre
 
 PRINT ''
 PRINT '================================================'
@@ -176,8 +237,44 @@ BEGIN
     SET @DateCol = NULL
     SELECT @DateCol = DateColumn FROM @Tables WHERE TableName = @TableName
 
-    IF @DateCol IS NOT NULL
+    IF OBJECT_ID(@TableName, 'U') IS NULL
     BEGIN
+        SET @Seq = @Seq + 1
+        CONTINUE
+    END
+
+    -- Check if this table uses FK-join delete (no date column)
+    IF EXISTS (SELECT 1 FROM @FKJoinDeletes WHERE ChildTable = @TableName AND ParentDateCol IS NOT NULL)
+    BEGIN
+        -- FK-join delete
+        SELECT @FKChild = ChildTable, @FKParent = ParentTable,
+               @FKChildCol = ChildFK, @FKParentCol = ParentPK,
+               @FKDateCol = ParentDateCol
+        FROM @FKJoinDeletes WHERE ChildTable = @TableName
+
+        PRINT 'Cleaning ' + @TableName + ' (FK join -> ' + @FKParent + '.' + @FKDateCol + ' < cutoff)...'
+        BEGIN TRY
+            SET @Deleted = 1
+            WHILE @Deleted > 0
+            BEGIN
+                SET @SQL = N'DELETE TOP (' + CAST(@BatchSize AS NVARCHAR) + N') child FROM [' + @TableName + N'] child ' +
+                    N'INNER JOIN [' + @FKParent + N'] parent ON child.[' + @FKChildCol + N'] = parent.[' + @FKParentCol + N'] ' +
+                    N'WHERE parent.[' + @FKDateCol + N'] < @cutoff'
+                EXEC sp_executesql @SQL, N'@cutoff DATETIME', @CutoffDate
+                SET @Deleted = @@ROWCOUNT
+                IF @Deleted > 0
+                    PRINT '  Deleted batch: ' + CAST(@Deleted AS VARCHAR)
+            END
+            CHECKPOINT
+            PRINT '  Done.'
+        END TRY
+        BEGIN CATCH
+            PRINT '  ERROR: ' + ERROR_MESSAGE()
+        END CATCH
+    END
+    ELSE IF @DateCol IS NOT NULL
+    BEGIN
+        -- Direct date-column delete
         PRINT 'Cleaning ' + @TableName + ' (WHERE ' + @DateCol + ' < cutoff)...'
         BEGIN TRY
             SET @Deleted = 1
@@ -198,9 +295,7 @@ BEGIN
     END
     ELSE
     BEGIN
-        -- Table might not exist in this HDB version — skip silently
-        IF OBJECT_ID(@TableName, 'U') IS NOT NULL
-            PRINT 'SKIP ' + @TableName + ' (no date column)'
+        PRINT 'SKIP ' + @TableName + ' (no date column and no FK-join rule)'
     END
 
     SET @Seq = @Seq + 1
@@ -228,6 +323,25 @@ BEGIN
 END
 CLOSE post_cur
 DEALLOCATE post_cur
+
+-- Also show FK-joined tables
+DECLARE fk_post CURSOR LOCAL FAST_FORWARD FOR
+    SELECT ChildTable FROM @FKJoinDeletes ORDER BY ChildTable
+
+OPEN fk_post
+FETCH NEXT FROM fk_post INTO @FKChild
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    IF OBJECT_ID(@FKChild, 'U') IS NOT NULL
+    BEGIN
+        SET @SQL = N'SELECT @cnt = COUNT(*) FROM [' + @FKChild + N']'
+        EXEC sp_executesql @SQL, N'@cnt BIGINT OUTPUT', @RowCount OUTPUT
+        PRINT '  ' + @FKChild + ': ' + CAST(@RowCount AS VARCHAR) + ' rows remaining (FK-joined)'
+    END
+    FETCH NEXT FROM fk_post INTO @FKChild
+END
+CLOSE fk_post
+DEALLOCATE fk_post
 
 PRINT ''
 PRINT '================================================'

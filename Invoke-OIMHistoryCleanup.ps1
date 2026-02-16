@@ -4,6 +4,12 @@
 # Purges archived data older than N years from one or more
 # OIM History Databases (TimeTrace databases).
 #
+# Handles two kinds of HDB tables:
+#   • Tables WITH a date column  → delete by date directly
+#   • Tables WITHOUT a date column (WatchProperty,
+#     ProcessSubstitute, RawWatchProperty, RawProcessSubstitute)
+#     → delete via FK join to the parent table's date column
+#
 # Usage:
 #   # Dry run (report only):
 #   .\Invoke-OIMHistoryCleanup.ps1 -SqlServer "myserver" -Database "OneIMHDB" -WhatIf
@@ -56,26 +62,67 @@ function Write-Log {
     Add-Content -Path $LogFile -Value $entry
 }
 
-# FK-safe delete order: children first, parents last
-$deleteOrder = @(
-    'RawWatchProperty',
-    'RawWatchOperation',
-    'RawProcessStep',
-    'RawProcessSubstitute',
-    'RawProcessChain',
-    'RawProcess',
-    'RawProcessGroup',
-    'RawJobHistory',
-    'WatchProperty',
-    'WatchOperation',
-    'ProcessStep',
-    'ProcessSubstitute',
-    'ProcessChain',
-    'ProcessInfo',
-    'ProcessGroup',
-    'HistoryJob',
-    'HistoryChain'
+# Tables to skip (metadata + non-HDB tables)
+$skipTables = @(
+    'SourceColumn', 'SourceDatabase', 'SourceTable',  # OIM metadata
+    'nsecauth', 'nsecimport',                          # Custom non-HDB tables
+    'sysdiagrams'                                      # SQL Server system table
 )
+
+# FK-safe delete order: children first, parents last
+# Tables WITHOUT a date column are included here — they will be handled
+# via FK-join deletes to their parent table's date column.
+$deleteOrder = @(
+    # Raw tables (children first)
+    'RawWatchProperty',      # FK -> RawWatchOperation.UID_DialogWatchOperation (no date col)
+    'RawWatchOperation',     # FK -> RawProcess.GenProcID
+    'RawProcessStep',        # FK -> RawProcessChain.UID_Tree
+    'RawProcessSubstitute',  # FK -> RawProcess.GenProcID (no date col)
+    'RawProcessChain',       # FK -> RawProcess.GenProcID
+    'RawProcess',            # FK -> RawProcessGroup.GenProcIDGroup
+    'RawProcessGroup',       # root raw table
+    'RawJobHistory',         # FK -> RawProcess.GenProcID
+    # Processed tables (children first)
+    'WatchProperty',         # FK -> WatchOperation.UID_DialogWatchOperation (NO DATE COL)
+    'WatchOperation',        # FK -> ProcessInfo.UID_ProcessInfo
+    'ProcessStep',           # FK -> ProcessChain.UID_ProcessChain
+    'ProcessSubstitute',     # FK -> ProcessInfo.UID_ProcessInfoNew/Origin (NO DATE COL)
+    'ProcessChain',          # FK -> ProcessInfo.UID_ProcessInfo
+    'HistoryJob',            # FK -> HistoryChain.UID_HistoryChain
+    'HistoryChain',          # FK -> ProcessInfo.UID_ProcessInfo
+    'ProcessInfo',           # FK -> ProcessGroup.UID_ProcessGroup
+    'ProcessGroup'           # root processed table
+)
+
+# Tables that have NO date column and must be purged via FK join to a parent.
+# Format: ChildTable -> @{ ParentTable; ChildFK; ParentPK; ParentDateCol }
+# The ParentDateCol is resolved dynamically; these define the join path.
+$fkJoinDeletes = @{
+    'WatchProperty' = @{
+        ParentTable  = 'WatchOperation'
+        ChildFK      = 'UID_DialogWatchOperation'
+        ParentPK     = 'UID_DialogWatchOperation'
+        ParentDateCol = $null  # resolved at runtime
+    }
+    'ProcessSubstitute' = @{
+        ParentTable  = 'ProcessInfo'
+        ChildFK      = 'UID_ProcessInfoNew'
+        ParentPK     = 'UID_ProcessInfo'
+        ParentDateCol = $null
+    }
+    'RawWatchProperty' = @{
+        ParentTable  = 'RawWatchOperation'
+        ChildFK      = 'UID_DialogWatchOperation'
+        ParentPK     = 'UID_DialogWatchOperation'
+        ParentDateCol = $null
+    }
+    'RawProcessSubstitute' = @{
+        ParentTable  = 'RawProcess'
+        ChildFK      = 'GenProcIDNew'
+        ParentPK     = 'GenProcID'
+        ParentDateCol = $null
+    }
+}
 
 Write-Log "================================================" "Cyan"
 Write-Log "OIM History Database Cleanup" "Cyan"
@@ -100,7 +147,12 @@ foreach ($db in $Database) {
 
     $dbTotal = 0
 
-    # Discover date columns for all tables in this HDB
+    $skipList = ($skipTables | ForEach-Object { "'$_'" }) -join ','
+
+    # Discover date columns for all HDB tables.
+    # Priority: OperationDate (WatchOperation), FirstDate (ProcessGroup/Info),
+    # XDateInserted (Raw*), ThisDate (ProcessChain/Step), StartAt (HistoryJob),
+    # ExportDate, then any other datetime column by ordinal position.
     $discoverQuery = "SELECT t.name AS TableName, c.name AS DateColumn " +
         "FROM sys.tables t " +
         "CROSS APPLY ( " +
@@ -109,14 +161,32 @@ foreach ($db in $Database) {
         "WHERE c.object_id = t.object_id " +
         "AND ty.name IN ('datetime','datetime2','smalldatetime','date') " +
         "ORDER BY CASE c.name " +
-        "WHEN 'XDateInserted' THEN 1 WHEN 'XDateUpdated' THEN 2 " +
-        "WHEN 'StartDate' THEN 3 WHEN 'EndDate' THEN 4 ELSE 5 END, " +
+        "WHEN 'OperationDate'  THEN 1 " +
+        "WHEN 'FirstDate'      THEN 2 " +
+        "WHEN 'XDateInserted'  THEN 3 " +
+        "WHEN 'ThisDate'       THEN 4 " +
+        "WHEN 'StartAt'        THEN 5 " +
+        "WHEN 'ExportDate'     THEN 6 " +
+        "WHEN 'XDateUpdated'   THEN 7 " +
+        "ELSE 10 END, " +
         "c.column_id) c " +
-        "WHERE t.name NOT IN ('SourceColumn','SourceDatabase','SourceTable') " +
+        "WHERE t.name NOT IN ($skipList) " +
         "ORDER BY t.name"
 
+    # Also discover tables that have NO date column (for FK-join deletes)
+    $noDateQuery = "SELECT t.name AS TableName " +
+        "FROM sys.tables t " +
+        "WHERE t.name NOT IN ($skipList) " +
+        "AND NOT EXISTS ( " +
+        "SELECT 1 FROM sys.columns c " +
+        "INNER JOIN sys.types ty ON c.user_type_id = ty.user_type_id " +
+        "WHERE c.object_id = t.object_id " +
+        "AND ty.name IN ('datetime','datetime2','smalldatetime','date') " +
+        ") ORDER BY t.name"
+
     try {
-        $tableInfo = Invoke-Sqlcmd @connParams -Database $db -Query $discoverQuery
+        $tableInfo   = Invoke-Sqlcmd @connParams -Database $db -Query $discoverQuery
+        $noDateTables = Invoke-Sqlcmd @connParams -Database $db -Query $noDateQuery
     }
     catch {
         Write-Log "  ERROR discovering tables: $($_.Exception.Message)" "Red"
@@ -129,7 +199,29 @@ foreach ($db in $Database) {
         $dateColumns[$row.TableName] = $row.DateColumn
     }
 
-    # Pre-flight counts
+    # Resolve parent date columns for FK-join tables
+    foreach ($childTbl in @($fkJoinDeletes.Keys)) {
+        $fk = $fkJoinDeletes[$childTbl]
+        if ($dateColumns.ContainsKey($fk.ParentTable)) {
+            $fk.ParentDateCol = $dateColumns[$fk.ParentTable]
+        }
+    }
+
+    # Log tables without date columns
+    if ($noDateTables) {
+        foreach ($row in $noDateTables) {
+            $tblName = $row.TableName
+            if ($fkJoinDeletes.ContainsKey($tblName)) {
+                $fk = $fkJoinDeletes[$tblName]
+                Write-Log "  INFO $tblName has no date column — will purge via FK join to $($fk.ParentTable).$($fk.ParentDateCol)" "DarkCyan"
+            }
+            else {
+                Write-Log "  WARN $tblName has no date column and no FK-join rule — will be SKIPPED" "Yellow"
+            }
+        }
+    }
+
+    # Pre-flight counts — tables with their own date column
     Write-Log "" "White"
     Write-Log "  Pre-flight summary:" "Yellow"
     foreach ($row in $tableInfo) {
@@ -145,6 +237,32 @@ foreach ($db in $Database) {
         }
     }
 
+    # Pre-flight counts — FK-joined tables (no date column)
+    foreach ($childTbl in @($fkJoinDeletes.Keys)) {
+        $fk = $fkJoinDeletes[$childTbl]
+        if (-not $fk.ParentDateCol) { continue }
+        # Check if child table exists in this database
+        try {
+            $existsQuery = "SELECT OBJECT_ID('$childTbl', 'U') AS ObjId"
+            $existsResult = Invoke-Sqlcmd @connParams -Database $db -Query $existsQuery
+            if ($null -eq $existsResult.ObjId) { continue }
+        }
+        catch { continue }
+
+        try {
+            $fkCountQuery = "SELECT " +
+                "(SELECT COUNT(*) FROM [$childTbl]) AS Total, " +
+                "(SELECT COUNT(*) FROM [$childTbl] child " +
+                "INNER JOIN [$($fk.ParentTable)] parent ON child.[$($fk.ChildFK)] = parent.[$($fk.ParentPK)] " +
+                "WHERE parent.[$($fk.ParentDateCol)] < '$cutoffStr') AS ToPurge"
+            $fkResult = Invoke-Sqlcmd @connParams -Database $db -Query $fkCountQuery
+            Write-Log "    $childTbl : $($fkResult.Total) total, $($fkResult.ToPurge) to purge (via $($fk.ParentTable).$($fk.ParentDateCol))" "Yellow"
+        }
+        catch {
+            Write-Log "    $childTbl : error counting — $($_.Exception.Message)" "Red"
+        }
+    }
+
     if ($WhatIf) {
         Write-Log "" "White"
         Write-Log "  WhatIf mode — no data deleted for $db" "Cyan"
@@ -156,24 +274,61 @@ foreach ($db in $Database) {
     Write-Log "  Deleting..." "White"
 
     foreach ($tbl in $deleteOrder) {
-        if (-not $dateColumns.ContainsKey($tbl)) {
-            # Table may not exist in this HDB version
+        # Determine delete strategy for this table
+        $isFkJoin  = $fkJoinDeletes.ContainsKey($tbl)
+        $hasDateCol = $dateColumns.ContainsKey($tbl)
+
+        if (-not $isFkJoin -and -not $hasDateCol) {
+            # Table not in this HDB version or not relevant
             continue
         }
 
-        $col = $dateColumns[$tbl]
+        # Verify table exists
+        try {
+            $existsQuery = "SELECT OBJECT_ID('$tbl', 'U') AS ObjId"
+            $existsResult = Invoke-Sqlcmd @connParams -Database $db -Query $existsQuery
+            if ($null -eq $existsResult.ObjId) { continue }
+        }
+        catch { continue }
 
         try {
             $totalDeleted = 0
-            do {
-                $deleteQuery = "SET NOCOUNT ON; DELETE TOP ($BatchSize) FROM [$tbl] WHERE [$col] < '$cutoffStr'; SELECT @@ROWCOUNT AS Deleted;"
-                $delResult = Invoke-Sqlcmd @connParams -Database $db -Query $deleteQuery
-                $deleted = $delResult.Deleted
-                $totalDeleted += $deleted
-                if ($deleted -gt 0) {
-                    Write-Log "    $tbl : deleted batch of $deleted ($totalDeleted total)" "DarkGray"
-                }
-            } while ($deleted -eq $BatchSize)
+
+            if ($isFkJoin -and $fkJoinDeletes[$tbl].ParentDateCol) {
+                # ── FK-join delete (no date column on this table) ──
+                $fk = $fkJoinDeletes[$tbl]
+                do {
+                    $deleteQuery = "SET NOCOUNT ON; " +
+                        "DELETE TOP ($BatchSize) child FROM [$tbl] child " +
+                        "INNER JOIN [$($fk.ParentTable)] parent " +
+                        "ON child.[$($fk.ChildFK)] = parent.[$($fk.ParentPK)] " +
+                        "WHERE parent.[$($fk.ParentDateCol)] < '$cutoffStr'; " +
+                        "SELECT @@ROWCOUNT AS Deleted;"
+                    $delResult = Invoke-Sqlcmd @connParams -Database $db -Query $deleteQuery
+                    $deleted = $delResult.Deleted
+                    $totalDeleted += $deleted
+                    if ($deleted -gt 0) {
+                        Write-Log "    $tbl : deleted batch of $deleted ($totalDeleted total) [FK join -> $($fk.ParentTable)]" "DarkGray"
+                    }
+                } while ($deleted -eq $BatchSize)
+            }
+            elseif ($hasDateCol) {
+                # ── Direct date-column delete ──
+                $col = $dateColumns[$tbl]
+                do {
+                    $deleteQuery = "SET NOCOUNT ON; DELETE TOP ($BatchSize) FROM [$tbl] WHERE [$col] < '$cutoffStr'; SELECT @@ROWCOUNT AS Deleted;"
+                    $delResult = Invoke-Sqlcmd @connParams -Database $db -Query $deleteQuery
+                    $deleted = $delResult.Deleted
+                    $totalDeleted += $deleted
+                    if ($deleted -gt 0) {
+                        Write-Log "    $tbl : deleted batch of $deleted ($totalDeleted total)" "DarkGray"
+                    }
+                } while ($deleted -eq $BatchSize)
+            }
+            else {
+                Write-Log "  SKIP $tbl : no date column and no FK-join rule" "Yellow"
+                continue
+            }
 
             if ($totalDeleted -gt 0) {
                 Write-Log "  OK $tbl : $totalDeleted rows purged" "Green"

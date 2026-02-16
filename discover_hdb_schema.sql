@@ -95,11 +95,14 @@ DECLARE cur CURSOR LOCAL FAST_FORWARD FOR
           AND ty.name IN ('datetime', 'datetime2', 'smalldatetime', 'date')
         ORDER BY
             CASE c2.name
-                WHEN 'XDateInserted' THEN 1
-                WHEN 'XDateUpdated'  THEN 2
-                WHEN 'StartDate'     THEN 3
-                WHEN 'EndDate'       THEN 4
-                ELSE 5
+                WHEN 'OperationDate'  THEN 1
+                WHEN 'FirstDate'      THEN 2
+                WHEN 'XDateInserted'  THEN 3
+                WHEN 'ThisDate'       THEN 4
+                WHEN 'StartAt'        THEN 5
+                WHEN 'ExportDate'     THEN 6
+                WHEN 'XDateUpdated'   THEN 7
+                ELSE 10
             END,
             c2.column_id
     ) c
