@@ -17,13 +17,10 @@ PRINT '1. ALL TABLES WITH ROW COUNTS';
 PRINT '================================================';
 
 SELECT
-    s.name                           AS SchemaName,
-    t.name                           AS TableName,
-    p.rows                           AS RowCount,
-    CAST(
-        (SUM(a.total_pages) * 8.0) / 1024
-        AS DECIMAL(12,2)
-    )                                AS SizeMB
+    s.name                                              AS SchemaName,
+    t.name                                              AS TableName,
+    p.rows                                              AS RowCount,
+    CAST((SUM(a.total_pages) * 8.0) / 1024 AS DECIMAL(12,2)) AS SizeMB
 FROM sys.tables t
 JOIN sys.schemas s          ON t.schema_id   = s.schema_id
 JOIN sys.indexes i          ON t.object_id   = i.object_id
@@ -111,13 +108,18 @@ SELECT
     i.name           AS IndexName,
     i.type_desc      AS IndexType,
     i.is_unique      AS IsUnique,
-    STRING_AGG(c.name, ', ') WITHIN GROUP (ORDER BY ic.key_ordinal) AS IndexColumns
+    STUFF((
+        SELECT ', ' + c2.name
+        FROM sys.index_columns ic2
+        JOIN sys.columns c2 ON ic2.object_id = c2.object_id AND ic2.column_id = c2.column_id
+        WHERE ic2.object_id = i.object_id AND ic2.index_id = i.index_id
+        ORDER BY ic2.key_ordinal
+        FOR XML PATH('')
+    ), 1, 2, '')    AS IndexColumns
 FROM sys.indexes i
-JOIN sys.tables t         ON i.object_id = t.object_id
-JOIN sys.index_columns ic ON i.object_id = ic.object_id AND i.index_id = ic.index_id
-JOIN sys.columns c        ON ic.object_id = c.object_id AND ic.column_id = c.column_id
+JOIN sys.tables t ON i.object_id = t.object_id
 WHERE i.type > 0  -- exclude heaps
-GROUP BY t.name, i.name, i.type_desc, i.is_unique
+GROUP BY t.name, i.name, i.type_desc, i.is_unique, i.object_id, i.index_id
 ORDER BY t.name, i.name;
 
 PRINT '';

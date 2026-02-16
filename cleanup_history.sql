@@ -245,7 +245,7 @@ BEGIN
             DELETE TOP (@BatchSize) c
             FROM PWODecisionStep c
             INNER JOIN PersonWantsOrg p ON c.UID_PersonWantsOrg = p.UID_PersonWantsOrg
-            WHERE p.XDateUpdated < @CutoffDate;
+            WHERE p.XDateUpdated < @Í;
             SET @Deleted = @@ROWCOUNT;
             IF @Deleted > 0 PRINT '  Deleted batch: ' + CAST(@Deleted AS VARCHAR);
         END
