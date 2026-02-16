@@ -56,9 +56,6 @@ function Write-Log {
     Add-Content -Path $LogFile -Value $entry
 }
 
-# Metadata tables — never delete
-$metadataTables = @('SourceColumn', 'SourceDatabase', 'SourceTable')
-
 # FK-safe delete order: children first, parents last
 $deleteOrder = @(
     'RawWatchProperty',
@@ -148,7 +145,7 @@ ORDER BY t.name
         $tbl = $row.TableName
         $col = $row.DateColumn
         try {
-            $countQuery = "SELECT COUNT(*) AS Total, SUM(CASE WHEN [$col] < '$cutoffStr' THEN 1 ELSE 0 END) AS ToPurge FROM [$tbl]"
+            $countQuery = "SELECT COUNT(*) AS Total, ISNULL(SUM(CASE WHEN [$col] < '$cutoffStr' THEN 1 ELSE 0 END), 0) AS ToPurge FROM [$tbl]"
             $result = Invoke-Sqlcmd @connParams -Database $db -Query $countQuery
             Write-Log "    $tbl : $($result.Total) total, $($result.ToPurge) to purge (by $col)" "Yellow"
         }
@@ -178,7 +175,7 @@ ORDER BY t.name
         try {
             $totalDeleted = 0
             do {
-                $deleteQuery = "DELETE TOP ($BatchSize) FROM [$tbl] WHERE [$col] < '$cutoffStr'; SELECT @@ROWCOUNT AS Deleted;"
+                $deleteQuery = "SET NOCOUNT ON; DELETE TOP ($BatchSize) FROM [$tbl] WHERE [$col] < '$cutoffStr'; SELECT @@ROWCOUNT AS Deleted;"
                 $delResult = Invoke-Sqlcmd @connParams -Database $db -Query $deleteQuery
                 $deleted = $delResult.Deleted
                 $totalDeleted += $deleted

@@ -116,7 +116,7 @@ OPEN preflight_cur
 FETCH NEXT FROM preflight_cur INTO @TableName, @DateCol
 WHILE @@FETCH_STATUS = 0
 BEGIN
-    SET @SQL = N'SELECT @total = COUNT(*), @old = SUM(CASE WHEN [' + @DateCol + N'] < @cutoff THEN 1 ELSE 0 END) FROM [' + @TableName + N']'
+    SET @SQL = N'SELECT @total = COUNT(*), @old = ISNULL(SUM(CASE WHEN [' + @DateCol + N'] < @cutoff THEN 1 ELSE 0 END), 0) FROM [' + @TableName + N']'
     EXEC sp_executesql @SQL,
         N'@cutoff DATETIME, @total BIGINT OUTPUT, @old BIGINT OUTPUT',
         @CutoffDate, @RowCount OUTPUT, @PurgeCount OUTPUT
