@@ -1,0 +1,74 @@
+# One Identity Manager — History Database Cleanup
+
+## Overview
+
+Scripts to purge history/journal data older than 2 years from One Identity Manager **History Databases** (HDBs). These are the separate archive databases, not the live application database — all data is historical.
+
+## Files
+
+| File | Description |
+|------|-------------|
+| `cleanup_history.sql` | Pure SQL script — run directly in SSMS against a single HDB |
+| `Invoke-OIMHistoryCleanup.ps1` | PowerShell wrapper with multi-HDB support, logging, batching, and dry-run |
+
+## Tables Cleaned
+
+| Table | Data |
+|-------|------|
+| `DialogHistory` | UI/process execution history |
+| `DialogJournal` | Change journal / audit trail |
+| `DialogJournalDetail` | Detailed change records (age-based + orphan cleanup) |
+| `JobHistory` | Job server execution history |
+| `PersonWantsOrg` | Archived request history (all records historical in HDB) |
+| `QBMDBQueueHistory` | DBQueue processor history |
+| `QBMProcessHistory` | Process orchestration logs |
+| `QBMDBQueueSlotHistory` | DBQueue slot history |
+| `*History*` (dynamic) | Any additional history tables found automatically |
+
+## Usage
+
+### SQL Script (SSMS)
+
+1. Open `cleanup_history.sql` in SQL Server Management Studio
+2. Connect to your One Identity Manager **History Database**
+3. **Run as-is for a dry run** — the dynamic section only counts rows
+4. Uncomment the `DELETE` blocks in Section 8 to enable full cleanup
+5. Repeat for each HDB if you have multiple
+
+### PowerShell Script (supports multiple HDBs)
+
+```powershell
+# Single HDB — dry run (report only)
+.\Invoke-OIMHistoryCleanup.ps1 -SqlServer "myserver" -Database "OneIMHDB" -WhatIf
+
+# Single HDB — actual cleanup (2-year retention, default)
+.\Invoke-OIMHistoryCleanup.ps1 -SqlServer "myserver" -Database "OneIMHDB"
+
+# Multiple HDBs — list them explicitly
+.\Invoke-OIMHistoryCleanup.ps1 -SqlServer "myserver" `
+    -Database "OneIMHDB","OneIMHDB2","OneIMHDB3","OneIMHDB4","OneIMHDB5","OneIMHDB6","OneIMHDB7" `
+    -WhatIf
+
+# Multiple HDBs — build the list dynamically (e.g. OneIMHDB, OneIMHDB2..OneIMHDB7)
+$hdbs = @("OneIMHDB") + (2..7 | ForEach-Object { "OneIMHDB$_" })
+.\Invoke-OIMHistoryCleanup.ps1 -SqlServer "myserver" -Database $hdbs -WhatIf
+
+# Auto-discover all HDBs from SQL Server
+$hdbs = (Invoke-Sqlcmd -ServerInstance "myserver" -Query "SELECT name FROM sys.databases WHERE name LIKE 'OneIMHDB%' ORDER BY name").name
+.\Invoke-OIMHistoryCleanup.ps1 -SqlServer "myserver" -Database $hdbs -WhatIf
+
+# Custom retention period (3 years)
+.\Invoke-OIMHistoryCleanup.ps1 -SqlServer "myserver" -Database "OneIMHDB","OneIMHDB2" -RetentionYears 3
+
+# Custom batch size
+.\Invoke-OIMHistoryCleanup.ps1 -SqlServer "myserver" -Database "OneIMHDB" -BatchSize 5000
+```
+
+## ⚠️ Important
+
+- **Always backup your database** before running these scripts
+- **Run the dry run first** to review what will be deleted
+- **Check compliance requirements** — some regulations require longer retention
+- **Schedule during maintenance windows** — batch deletes can cause lock contention
+- **Rebuild indexes** after large deletions for optimal performance
+- Requires the `SqlServer` PowerShell module (`Install-Module SqlServer`)
