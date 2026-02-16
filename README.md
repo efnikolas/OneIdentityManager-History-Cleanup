@@ -2,42 +2,72 @@
 
 ## Overview
 
-Scripts to purge history/journal data older than 2 years from One Identity Manager **History Databases** (HDBs). These are the separate archive databases, not the live application database — all data is historical.
+Scripts to purge archived data older than 2 years from One Identity Manager **History Databases** (HDBs / TimeTrace databases). These are the separate archive databases used by OIM's Data Archiving feature — they contain process monitoring, change tracking, and job history data imported from the live application database.
+
+> **Important:** The HDB schema is completely different from the application database. Tables like `DialogHistory` or `PersonWantsOrg` do **not** exist in the HDB. This toolkit targets the correct HDB tables as documented in the [OIM Data Archiving Administration Guide](https://support.oneidentity.com/technical-documents/identity-manager/9.2/data-archiving-administration-guide).
 
 ## Files
 
 | File | Description |
 |------|-------------|
-| `cleanup_history.sql` | Pure SQL script — run directly in SSMS against a single HDB |
-| `Invoke-OIMHistoryCleanup.ps1` | PowerShell wrapper with multi-HDB support, logging, batching, and dry-run |
-| `create_test_data.sql` | Inserts ~335K prefixed (`TEST_CLEANUP_`) test rows into an existing HDB |
-| `remove_test_data.sql` | Removes all `TEST_CLEANUP_` test rows — restores HDB to its original state |
+| `cleanup_history.sql` | Main SQL cleanup script — run in SSMS against a single HDB |
+| `Invoke-OIMHistoryCleanup.ps1` | PowerShell wrapper — multi-HDB support, logging, batching, dry-run |
+| `discover_hdb_schema.sql` | Schema discovery — inspect tables, columns, FKs, row counts, sample data |
+| `create_test_data.sql` | Inserts `TEST_CLEANUP_` prefixed test rows into an HDB for safe testing |
+| `remove_test_data.sql` | Removes all `TEST_CLEANUP_` test rows to restore the HDB |
 
-## Tables Cleaned
+## HDB Table Reference
 
-| Table | Data |
-|-------|------|
-| `DialogHistory` | UI/process execution history |
-| `DialogJournal` | Change journal / audit trail |
-| `DialogJournalDetail` | Detailed change records (age-based + orphan cleanup) |
-| `JobHistory` | Job server execution history |
-| `PersonWantsOrg` | Archived request history (all records historical in HDB) |
-| `QBMDBQueueHistory` | DBQueue processor history |
-| `QBMProcessHistory` | Process orchestration logs |
-| `QBMDBQueueSlotHistory` | DBQueue slot history |
-| `*History*` (dynamic) | Any additional history tables found automatically |
+The OIM History Database contains 20 tables in three categories:
+
+### Raw Data (bulk-imported from application DB)
+
+| HDB Table | Source (App DB) | Description |
+|-----------|----------------|-------------|
+| `RawJobHistory` | `JobHistory` | Raw process history records |
+| `RawProcess` | `DialogProcess` | Raw process triggers/actions |
+| `RawProcessChain` | `DialogProcessChain` | Raw process chain tracking |
+| `RawProcessGroup` | `DialogProcess` (GenProcIDGroup) | Raw process trigger grouping |
+| `RawProcessStep` | `DialogProcessStep` | Raw process step tracking |
+| `RawProcessSubstitute` | `DialogProcessSubstitute` | Raw process substitution records |
+| `RawWatchOperation` | `DialogWatchOperation` | Raw data change operations |
+| `RawWatchProperty` | `DialogWatchProperty` | Raw data change property values |
+
+### Aggregated Data (statistical summaries)
+
+| HDB Table | Derived From | Description |
+|-----------|-------------|-------------|
+| `HistoryChain` | `RawJobHistory` | Process history chains |
+| `HistoryJob` | `RawJobHistory` | Process history steps |
+| `ProcessChain` | `RawProcessChain` | Aggregated process chains |
+| `ProcessGroup` | `RawProcessGroup` | Aggregated process groups |
+| `ProcessInfo` | `RawProcess` | Aggregated process triggers |
+| `ProcessStep` | `RawProcessStep` | Aggregated process steps |
+| `ProcessSubstitute` | `RawProcessSubstitute` | Aggregated substitution records |
+| `WatchOperation` | `RawWatchOperation` | Aggregated data change operations |
+| `WatchProperty` | `RawWatchProperty` | Aggregated data change properties |
+
+### Metadata (DO NOT DELETE)
+
+| HDB Table | Description |
+|-----------|-------------|
+| `SourceColumn` | Source column definitions |
+| `SourceDatabase` | Source database references |
+| `SourceTable` | Source table definitions |
 
 ## Usage
 
 ### SQL Script (SSMS)
 
 1. Open `cleanup_history.sql` in SQL Server Management Studio
-2. Connect to your One Identity Manager **History Database**
-3. **Run as-is for a dry run** — the dynamic section only counts rows
-4. Uncomment the `DELETE` blocks in Section 8 to enable full cleanup
-5. Repeat for each HDB if you have multiple
+2. Change `USE [OneIMHDB]` to your History Database name
+3. Connect to the SQL Server hosting the HDB
+4. Run — the script prints a pre-flight summary, deletes old data in FK-safe order, and prints remaining counts
+5. Repeat for each HDB, or use the PowerShell wrapper for multiple databases
 
 ### PowerShell Script (supports multiple HDBs)
+
+Requires the `SqlServer` PowerShell module (`Install-Module SqlServer`).
 
 ```powershell
 # Single HDB — dry run (report only)
@@ -66,38 +96,41 @@ $hdbs = (Invoke-Sqlcmd -ServerInstance "myserver" -Query "SELECT name FROM sys.d
 .\Invoke-OIMHistoryCleanup.ps1 -SqlServer "myserver" -Database "OneIMHDB" -BatchSize 5000
 ```
 
+### Schema Discovery
+
+Run `discover_hdb_schema.sql` to inspect an HDB before cleanup:
+
+```
+1. Open discover_hdb_schema.sql in SSMS
+2. Change USE [OneIMHDB] to your HDB
+3. Run — outputs tables, row counts, sizes, FKs, date columns, and sample data
+```
+
 ## Testing with Real HDBs
 
-The test scripts let you safely validate the cleanup against a **real History Database** without risking existing data. All test rows are tagged with a `TEST_CLEANUP_` prefix.
+The test scripts let you safely validate the cleanup against a **real History Database** without risking existing data. All test rows use a `TEST_CLEANUP_` prefix.
 
 ```
 1. Edit create_test_data.sql → change USE [OneIMHDB] to your HDB
-2. Run create_test_data.sql   → inserts ~335K prefixed rows (spread over 4 years)
-3. Run cleanup_history.sql    → purges rows older than 2 years (real + test)
-4. Verify that old TEST_CLEANUP_ rows were deleted
+2. Run create_test_data.sql   → inserts prefixed test rows (spread over 4 years)
+3. Run cleanup_history.sql    → purges rows older than 2 years
+4. Verify that old TEST_CLEANUP_ rows were deleted (see queries below)
 5. Run remove_test_data.sql   → removes ALL remaining TEST_CLEANUP_ rows
 6. Your HDB is back to its original state
 ```
 
-### Quick Verification Queries (per table)
+## How It Works
 
-Run these after `cleanup_history.sql` to confirm old test rows were purged. Only rows newer than 2 years should remain.
+1. **Dynamic date column discovery** — each table is scanned for datetime columns, preferring `XDateInserted` > `XDateUpdated` > `StartDate` > `EndDate`
+2. **FK-safe delete order** — Raw child tables are deleted before their Aggregated parent tables
+3. **Batched deletes** — rows are deleted in configurable batches (default 10,000) with `CHECKPOINT` after each table to manage transaction log growth
+4. **Metadata protection** — `SourceColumn`, `SourceDatabase`, and `SourceTable` are never touched
 
-```sql
--- DialogHistory
-SELECT COUNT(*) AS Remaining FROM DialogHistory WHERE XUserInserted LIKE 'TEST_CLEANUP_%' AND XDateInserted < DATEADD(YEAR, -2, GETDATE());
+## Compatibility
 
--- DialogJournal
-SELECT COUNT(*) AS Remaining FROM DialogJournal WHERE XUserInserted LIKE 'TEST_CLEANUP_%' AND XDateInserted < DATEADD(YEAR, -2, GETDATE());
-
--- DialogJournalDetail
-SELECT COUNT(*) AS Remaining FROM DialogJournalDetail WHERE ColumnName LIKE 'TEST_CLEANUP_%' AND XDateInserted < DATEADD(YEAR, -2, GETDATE());
-
--- JobHistory
-SELECT COUNT(*) AS Remaining FROM JobHistory WHERE XUserInserted LIKE 'TEST_CLEANUP_%' AND XDateInserted < DATEADD(YEAR, -2, GETDATE());
-
--- PersonWantsOrg (uses XDateUpdated)
-SELECT COUNT(*) AS Remaining FROM PersonWantsOrg WHERE XUserInserted LIKE 'TEST_CLEANUP_%' AND XDateUpdated < DATEADD(YEAR, -2, GETDATE());
+- SQL Server 2012+
+- One Identity Manager 8.x / 9.x History Databases
+- PowerShell 5.1+ with SqlServer module
 
 -- QBMDBQueueHistory
 SELECT COUNT(*) AS Remaining FROM QBMDBQueueHistory WHERE SlotName LIKE 'TEST_CLEANUP_%' AND XDateInserted < DATEADD(YEAR, -2, GETDATE());

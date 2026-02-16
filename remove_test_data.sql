@@ -1,104 +1,89 @@
 -- ============================================================
--- One Identity Manager — Remove ALL TEST_CLEANUP_ Test Data
+-- One Identity Manager — Remove HDB Test Data
 -- ============================================================
--- Removes every row inserted by create_test_data.sql.
--- Identifies test data by the 'TEST_CLEANUP_' prefix on
--- text columns — real HDB data is never touched.
+-- Removes all rows inserted by create_test_data.sql by
+-- looking for the TEST_CLEANUP_ prefix in string columns.
 --
--- Run this AFTER you have finished testing cleanup_history.sql
--- to leave the HDB exactly as it was before testing.
+-- Deletes in FK-safe order (children before parents).
 -- ============================================================
 
--- ⚠️ CHANGE THIS to your actual History Database name
-USE [OneIMHDB];
+-- CHANGE THIS to your test History Database
+USE [OneIMHDB]
 GO
 
-PRINT '================================================';
-PRINT 'Removing ALL TEST_CLEANUP_ test data...';
-PRINT '================================================';
+SET NOCOUNT ON
 
-DECLARE @Deleted INT;
+DECLARE @Prefix NVARCHAR(20) = N'TEST_CLEANUP_'
 
--- ── 1. DialogJournalDetail (must go before DialogJournal — FK) ──
-PRINT 'Removing DialogJournalDetail...';
-DELETE FROM DialogJournalDetail
-WHERE ColumnName LIKE N'TEST_CLEANUP_%';
-SET @Deleted = @@ROWCOUNT;
-PRINT '  -> DialogJournalDetail: ' + CAST(@Deleted AS VARCHAR) + ' rows removed.';
+PRINT '================================================'
+PRINT 'Removing HDB test data'
+PRINT 'Database: ' + DB_NAME()
+PRINT 'Prefix:   ' + @Prefix
+PRINT '================================================'
+PRINT ''
 
--- ── 2. DialogJournal ────────────────────────────────────
-PRINT 'Removing DialogJournal...';
-DELETE FROM DialogJournal
-WHERE XUserInserted LIKE N'TEST_CLEANUP_%';
-SET @Deleted = @@ROWCOUNT;
-PRINT '  -> DialogJournal: ' + CAST(@Deleted AS VARCHAR) + ' rows removed.';
+-- FK-safe delete order (same as cleanup_history.sql)
+DECLARE @DeleteOrder TABLE (Seq INT IDENTITY(1,1), TableName NVARCHAR(256))
+INSERT INTO @DeleteOrder (TableName) VALUES
+    ('RawWatchProperty'), ('RawWatchOperation'),
+    ('RawProcessStep'), ('RawProcessSubstitute'),
+    ('RawProcessChain'), ('RawProcess'), ('RawProcessGroup'),
+    ('RawJobHistory'),
+    ('WatchProperty'), ('WatchOperation'),
+    ('ProcessStep'), ('ProcessSubstitute'),
+    ('ProcessChain'), ('ProcessInfo'), ('ProcessGroup'),
+    ('HistoryJob'), ('HistoryChain')
 
--- ── 3. DialogHistory ────────────────────────────────────
-PRINT 'Removing DialogHistory...';
-DELETE FROM DialogHistory
-WHERE XUserInserted LIKE N'TEST_CLEANUP_%';
-SET @Deleted = @@ROWCOUNT;
-PRINT '  -> DialogHistory: ' + CAST(@Deleted AS VARCHAR) + ' rows removed.';
+DECLARE @TableName  NVARCHAR(256)
+DECLARE @StringCol  NVARCHAR(256)
+DECLARE @SQL        NVARCHAR(MAX)
+DECLARE @Deleted    INT
+DECLARE @Seq        INT = 1
+DECLARE @MaxSeq     INT = (SELECT MAX(Seq) FROM @DeleteOrder)
 
--- ── 4. JobHistory ───────────────────────────────────────
-PRINT 'Removing JobHistory...';
-DELETE FROM JobHistory
-WHERE XUserInserted LIKE N'TEST_CLEANUP_%';
-SET @Deleted = @@ROWCOUNT;
-PRINT '  -> JobHistory: ' + CAST(@Deleted AS VARCHAR) + ' rows removed.';
+WHILE @Seq <= @MaxSeq
+BEGIN
+    SELECT @TableName = TableName FROM @DeleteOrder WHERE Seq = @Seq
 
--- ── 5. PersonWantsOrg ───────────────────────────────────
-PRINT 'Removing PersonWantsOrg...';
-DELETE FROM PersonWantsOrg
-WHERE XUserInserted LIKE N'TEST_CLEANUP_%';
-SET @Deleted = @@ROWCOUNT;
-PRINT '  -> PersonWantsOrg: ' + CAST(@Deleted AS VARCHAR) + ' rows removed.';
+    IF OBJECT_ID(@TableName, 'U') IS NULL
+    BEGIN
+        SET @Seq = @Seq + 1
+        CONTINUE
+    END
 
--- ── 6. QBMDBQueueHistory ────────────────────────────────
-PRINT 'Removing QBMDBQueueHistory...';
-DELETE FROM QBMDBQueueHistory
-WHERE SlotName LIKE N'TEST_CLEANUP_%';
-SET @Deleted = @@ROWCOUNT;
-PRINT '  -> QBMDBQueueHistory: ' + CAST(@Deleted AS VARCHAR) + ' rows removed.';
+    -- Find a string column long enough to hold the prefix
+    SET @StringCol = NULL
+    SELECT TOP 1 @StringCol = c.name
+    FROM sys.columns c
+    INNER JOIN sys.types ty ON c.user_type_id = ty.user_type_id
+    WHERE c.object_id = OBJECT_ID(@TableName)
+      AND ty.name IN ('nvarchar', 'varchar', 'nchar', 'char')
+      AND c.max_length >= 26
+    ORDER BY c.column_id
 
--- ── 7. QBMProcessHistory ────────────────────────────────
-PRINT 'Removing QBMProcessHistory...';
-DELETE FROM QBMProcessHistory
-WHERE ProcessName LIKE N'TEST_CLEANUP_%';
-SET @Deleted = @@ROWCOUNT;
-PRINT '  -> QBMProcessHistory: ' + CAST(@Deleted AS VARCHAR) + ' rows removed.';
+    IF @StringCol IS NULL
+    BEGIN
+        PRINT 'SKIP ' + @TableName + ' — no searchable string column'
+        SET @Seq = @Seq + 1
+        CONTINUE
+    END
 
--- ── 8. QBMDBQueueSlotHistory ────────────────────────────
-PRINT 'Removing QBMDBQueueSlotHistory...';
-DELETE FROM QBMDBQueueSlotHistory
-WHERE SlotName LIKE N'TEST_CLEANUP_%';
-SET @Deleted = @@ROWCOUNT;
-PRINT '  -> QBMDBQueueSlotHistory: ' + CAST(@Deleted AS VARCHAR) + ' rows removed.';
+    SET @SQL = N'DELETE FROM [' + @TableName + N'] WHERE [' + @StringCol + N'] LIKE @prefix + ''%'''
 
--- ── Verify nothing remains ──────────────────────────────
-PRINT '';
-PRINT '================================================';
-PRINT 'Verification — remaining TEST_CLEANUP_ rows:';
-PRINT '================================================';
+    BEGIN TRY
+        EXEC sp_executesql @SQL, N'@prefix NVARCHAR(20)', @Prefix
+        SET @Deleted = @@ROWCOUNT
+        PRINT @TableName + ': ' + CAST(@Deleted AS VARCHAR) + ' test rows removed'
+    END TRY
+    BEGIN CATCH
+        PRINT @TableName + ': ERROR — ' + ERROR_MESSAGE()
+    END CATCH
 
-SELECT 'DialogHistory' AS TableName, COUNT(*) AS Remaining FROM DialogHistory WHERE XUserInserted LIKE N'TEST_CLEANUP_%'
-UNION ALL
-SELECT 'DialogJournal',           COUNT(*) FROM DialogJournal        WHERE XUserInserted LIKE N'TEST_CLEANUP_%'
-UNION ALL
-SELECT 'DialogJournalDetail',     COUNT(*) FROM DialogJournalDetail  WHERE ColumnName    LIKE N'TEST_CLEANUP_%'
-UNION ALL
-SELECT 'JobHistory',              COUNT(*) FROM JobHistory           WHERE XUserInserted LIKE N'TEST_CLEANUP_%'
-UNION ALL
-SELECT 'PersonWantsOrg',          COUNT(*) FROM PersonWantsOrg       WHERE XUserInserted LIKE N'TEST_CLEANUP_%'
-UNION ALL
-SELECT 'QBMDBQueueHistory',       COUNT(*) FROM QBMDBQueueHistory    WHERE SlotName      LIKE N'TEST_CLEANUP_%'
-UNION ALL
-SELECT 'QBMProcessHistory',       COUNT(*) FROM QBMProcessHistory    WHERE ProcessName   LIKE N'TEST_CLEANUP_%'
-UNION ALL
-SELECT 'QBMDBQueueSlotHistory',   COUNT(*) FROM QBMDBQueueSlotHistory WHERE SlotName     LIKE N'TEST_CLEANUP_%'
-ORDER BY TableName;
+    SET @Seq = @Seq + 1
+END
 
-PRINT '';
-PRINT 'All TEST_CLEANUP_ test data has been removed.';
-PRINT 'Your HDB is back to its original state.';
+PRINT ''
+PRINT '================================================'
+PRINT 'Test data removal complete.'
+PRINT '================================================'
 GO

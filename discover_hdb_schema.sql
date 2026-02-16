@@ -1,160 +1,128 @@
 -- ============================================================
--- One Identity Manager — HDB Schema Discovery (File Output)
+-- One Identity Manager — HDB Schema Discovery Script
 -- ============================================================
--- Writes all results to C:\temp\hdb_schema.txt
--- Change the output path and database name below as needed.
+-- Run this against an OIM History Database (TimeTrace DB)
+-- to inspect table structure, row counts, date columns,
+-- and foreign key relationships.
+--
+-- Compatible with SQL Server 2012+.
 -- ============================================================
 
--- CHANGE THESE TWO VALUES:
-USE [OneIMHDB]
+PRINT '==========================================='
+PRINT '  HDB Schema Discovery'
+PRINT '  Database: ' + DB_NAME()
+PRINT '  Run at:   ' + CONVERT(VARCHAR(30), GETDATE(), 120)
+PRINT '==========================================='
 GO
 
--- Output file path (folder must exist)
-DECLARE @OutFile NVARCHAR(500) = N'C:\temp\hdb_schema.txt'
+-- 1. Tables and Row Counts
+PRINT ''
+PRINT '--- 1. Tables and Row Counts ---'
+SELECT
+    t.name           AS TableName,
+    p.rows           AS ApproxRowCount,
+    CAST(ROUND(SUM(a.total_pages) * 8.0 / 1024, 2) AS DECIMAL(12,2)) AS SizeMB
+FROM sys.tables t
+INNER JOIN sys.indexes i      ON t.object_id = i.object_id AND i.index_id <= 1
+INNER JOIN sys.partitions p   ON i.object_id = p.object_id AND i.index_id = p.index_id
+INNER JOIN sys.allocation_units a ON p.partition_id = a.container_id
+GROUP BY t.name, p.rows
+ORDER BY t.name
+GO
 
--- Create/clear the file
-DECLARE @cmd NVARCHAR(1000)
-SET @cmd = N'echo. > ' + @OutFile
-EXEC xp_cmdshell @cmd, no_output
+-- 2. Foreign Key Relationships
+PRINT ''
+PRINT '--- 2. Foreign Key Relationships ---'
+SELECT
+    fk.name                              AS FK_Name,
+    OBJECT_NAME(fk.parent_object_id)     AS ChildTable,
+    cp.name                              AS ChildColumn,
+    OBJECT_NAME(fk.referenced_object_id) AS ParentTable,
+    cr.name                              AS ParentColumn
+FROM sys.foreign_keys fk
+INNER JOIN sys.foreign_key_columns fkc ON fk.object_id = fkc.constraint_object_id
+INNER JOIN sys.columns cp ON fkc.parent_object_id = cp.object_id AND fkc.parent_column_id = cp.column_id
+INNER JOIN sys.columns cr ON fkc.referenced_object_id = cr.object_id AND fkc.referenced_column_id = cr.column_id
+ORDER BY ChildTable, ParentTable
+GO
 
--- Helper: append a line to the file
--- We use bcp/sqlcmd style but simplest is xp_cmdshell echo
-DECLARE @line NVARCHAR(4000)
+-- 3. Date/Time Columns per Table
+PRINT ''
+PRINT '--- 3. Date/Time Columns ---'
+SELECT
+    t.name  AS TableName,
+    c.name  AS ColumnName,
+    ty.name AS DataType
+FROM sys.tables t
+INNER JOIN sys.columns c ON t.object_id = c.object_id
+INNER JOIN sys.types ty  ON c.user_type_id = ty.user_type_id
+WHERE ty.name IN ('datetime', 'datetime2', 'smalldatetime', 'date', 'datetimeoffset')
+ORDER BY t.name, c.column_id
+GO
 
--- ── HEADER ──
-SET @cmd = N'echo ================================================ >> ' + @OutFile
-EXEC xp_cmdshell @cmd, no_output
-SET @cmd = N'echo HDB SCHEMA DISCOVERY >> ' + @OutFile
-EXEC xp_cmdshell @cmd, no_output
-SET @cmd = N'echo Database: ' + DB_NAME() + N' >> ' + @OutFile
-EXEC xp_cmdshell @cmd, no_output
-SET @cmd = N'echo Date: ' + CONVERT(NVARCHAR, GETDATE(), 120) + N' >> ' + @OutFile
-EXEC xp_cmdshell @cmd, no_output
-SET @cmd = N'echo ================================================ >> ' + @OutFile
-EXEC xp_cmdshell @cmd, no_output
+-- 4. All Columns per Table
+PRINT ''
+PRINT '--- 4. All Columns ---'
+SELECT
+    t.name          AS TableName,
+    c.name          AS ColumnName,
+    ty.name         AS DataType,
+    c.max_length    AS MaxLength,
+    c.is_nullable   AS Nullable,
+    c.column_id     AS OrdinalPos
+FROM sys.tables t
+INNER JOIN sys.columns c ON t.object_id = c.object_id
+INNER JOIN sys.types ty  ON c.user_type_id = ty.user_type_id
+ORDER BY t.name, c.column_id
+GO
 
--- ── 1. TABLES AND ROW COUNTS ──
-SET @cmd = N'echo. >> ' + @OutFile
-EXEC xp_cmdshell @cmd, no_output
-SET @cmd = N'echo === 1. TABLES AND ROW COUNTS === >> ' + @OutFile
-EXEC xp_cmdshell @cmd, no_output
+-- 5. Sample Data (top 3 rows from each table, oldest first by date)
+PRINT ''
+PRINT '--- 5. Sample Data ---'
 
-DECLARE @tname NVARCHAR(256)
-DECLARE @rows BIGINT
+DECLARE @tbl NVARCHAR(128)
+DECLARE @col NVARCHAR(128)
+DECLARE @sql NVARCHAR(MAX)
 
-DECLARE tbl_cur CURSOR FOR
-    SELECT t.name, p.[rows]
+DECLARE cur CURSOR LOCAL FAST_FORWARD FOR
+    SELECT t.name AS TableName, c.DateColumn
     FROM sys.tables t
-    INNER JOIN sys.partitions p ON t.object_id = p.object_id
-    WHERE p.index_id IN (0, 1)
-    ORDER BY p.[rows] DESC
+    CROSS APPLY (
+        SELECT TOP 1 c2.name AS DateColumn
+        FROM sys.columns c2
+        INNER JOIN sys.types ty ON c2.user_type_id = ty.user_type_id
+        WHERE c2.object_id = t.object_id
+          AND ty.name IN ('datetime', 'datetime2', 'smalldatetime', 'date')
+        ORDER BY
+            CASE c2.name
+                WHEN 'XDateInserted' THEN 1
+                WHEN 'XDateUpdated'  THEN 2
+                WHEN 'StartDate'     THEN 3
+                WHEN 'EndDate'       THEN 4
+                ELSE 5
+            END,
+            c2.column_id
+    ) c
+    ORDER BY t.name
 
-OPEN tbl_cur
-FETCH NEXT FROM tbl_cur INTO @tname, @rows
+OPEN cur
+FETCH NEXT FROM cur INTO @tbl, @col
+
 WHILE @@FETCH_STATUS = 0
 BEGIN
-    SET @cmd = N'echo ' + @tname + N' | ' + CAST(@rows AS NVARCHAR) + N' >> ' + @OutFile
-    EXEC xp_cmdshell @cmd, no_output
-    FETCH NEXT FROM tbl_cur INTO @tname, @rows
+    PRINT ''
+    PRINT '>> ' + @tbl + ' (ordered by ' + @col + '):'
+    SET @sql = N'SELECT TOP 3 * FROM [' + @tbl + N'] ORDER BY [' + @col + N'] ASC'
+    EXEC sp_executesql @sql
+    FETCH NEXT FROM cur INTO @tbl, @col
 END
-CLOSE tbl_cur
-DEALLOCATE tbl_cur
 
--- ── 2. FOREIGN KEYS ──
-SET @cmd = N'echo. >> ' + @OutFile
-EXEC xp_cmdshell @cmd, no_output
-SET @cmd = N'echo === 2. FOREIGN KEYS === >> ' + @OutFile
-EXEC xp_cmdshell @cmd, no_output
+CLOSE cur
+DEALLOCATE cur
+GO
 
-DECLARE @fkname NVARCHAR(256)
-DECLARE @child NVARCHAR(256)
-DECLARE @childcol NVARCHAR(256)
-DECLARE @parent NVARCHAR(256)
-DECLARE @parentcol NVARCHAR(256)
-
-DECLARE fk_cur CURSOR FOR
-    SELECT fk.name, tp.name, cp.name, tr.name, cr.name
-    FROM sys.foreign_keys fk
-    INNER JOIN sys.tables tp ON fk.parent_object_id = tp.object_id
-    INNER JOIN sys.tables tr ON fk.referenced_object_id = tr.object_id
-    INNER JOIN sys.foreign_key_columns fkc ON fk.object_id = fkc.constraint_object_id
-    INNER JOIN sys.columns cp ON fkc.parent_object_id = cp.object_id AND fkc.parent_column_id = cp.column_id
-    INNER JOIN sys.columns cr ON fkc.referenced_object_id = cr.object_id AND fkc.referenced_column_id = cr.column_id
-    ORDER BY tp.name
-
-OPEN fk_cur
-FETCH NEXT FROM fk_cur INTO @fkname, @child, @childcol, @parent, @parentcol
-WHILE @@FETCH_STATUS = 0
-BEGIN
-    SET @cmd = N'echo ' + @child + N'.' + @childcol + N' -> ' + @parent + N'.' + @parentcol + N' (' + @fkname + N') >> ' + @OutFile
-    EXEC xp_cmdshell @cmd, no_output
-    FETCH NEXT FROM fk_cur INTO @fkname, @child, @childcol, @parent, @parentcol
-END
-CLOSE fk_cur
-DEALLOCATE fk_cur
-
--- ── 3. DATE COLUMNS ──
-SET @cmd = N'echo. >> ' + @OutFile
-EXEC xp_cmdshell @cmd, no_output
-SET @cmd = N'echo === 3. DATE COLUMNS === >> ' + @OutFile
-EXEC xp_cmdshell @cmd, no_output
-
-DECLARE @colname NVARCHAR(256)
-DECLARE @dtype NVARCHAR(50)
-
-DECLARE dt_cur CURSOR FOR
-    SELECT t.name, c.name, ty.name
-    FROM sys.columns c
-    INNER JOIN sys.tables t ON c.object_id = t.object_id
-    INNER JOIN sys.types ty ON c.user_type_id = ty.user_type_id
-    WHERE ty.name IN ('datetime', 'datetime2', 'smalldatetime', 'date')
-    ORDER BY t.name, c.column_id
-
-OPEN dt_cur
-FETCH NEXT FROM dt_cur INTO @tname, @colname, @dtype
-WHILE @@FETCH_STATUS = 0
-BEGIN
-    SET @cmd = N'echo ' + @tname + N' | ' + @colname + N' | ' + @dtype + N' >> ' + @OutFile
-    EXEC xp_cmdshell @cmd, no_output
-    FETCH NEXT FROM dt_cur INTO @tname, @colname, @dtype
-END
-CLOSE dt_cur
-DEALLOCATE dt_cur
-
--- ── 4. ALL COLUMNS ──
-SET @cmd = N'echo. >> ' + @OutFile
-EXEC xp_cmdshell @cmd, no_output
-SET @cmd = N'echo === 4. ALL COLUMNS === >> ' + @OutFile
-EXEC xp_cmdshell @cmd, no_output
-
-DECLARE @maxlen INT
-DECLARE @nullable BIT
-
-DECLARE col_cur CURSOR FOR
-    SELECT t.name, c.name, ty.name, c.max_length, c.is_nullable
-    FROM sys.columns c
-    INNER JOIN sys.tables t ON c.object_id = t.object_id
-    INNER JOIN sys.types ty ON c.user_type_id = ty.user_type_id
-    ORDER BY t.name, c.column_id
-
-OPEN col_cur
-FETCH NEXT FROM col_cur INTO @tname, @colname, @dtype, @maxlen, @nullable
-WHILE @@FETCH_STATUS = 0
-BEGIN
-    SET @cmd = N'echo ' + @tname + N' | ' + @colname + N' | ' + @dtype + N'(' + CAST(@maxlen AS NVARCHAR) + N') | nullable=' + CAST(@nullable AS NVARCHAR) + N' >> ' + @OutFile
-    EXEC xp_cmdshell @cmd, no_output
-    FETCH NEXT FROM col_cur INTO @tname, @colname, @dtype, @maxlen, @nullable
-END
-CLOSE col_cur
-DEALLOCATE col_cur
-
--- ── DONE ──
-SET @cmd = N'echo. >> ' + @OutFile
-EXEC xp_cmdshell @cmd, no_output
-SET @cmd = N'echo ================================================ >> ' + @OutFile
-EXEC xp_cmdshell @cmd, no_output
-SET @cmd = N'echo Discovery complete. Share this file. >> ' + @OutFile
-EXEC xp_cmdshell @cmd, no_output
-
-PRINT 'Results written to: ' + @OutFile
+PRINT ''
+PRINT '==========================================='
+PRINT '  Discovery complete.'
+PRINT '==========================================='
 GO
