@@ -10,7 +10,8 @@ Scripts to purge history/journal data older than 2 years from One Identity Manag
 |------|-------------|
 | `cleanup_history.sql` | Pure SQL script — run directly in SSMS against a single HDB |
 | `Invoke-OIMHistoryCleanup.ps1` | PowerShell wrapper with multi-HDB support, logging, batching, and dry-run |
-| `create_test_data.sql` | Creates a `TestOneIMHDB` database with bulk test data for validation |
+| `create_test_data.sql` | Inserts ~335K prefixed (`TEST_CLEANUP_`) test rows into an existing HDB |
+| `remove_test_data.sql` | Removes all `TEST_CLEANUP_` test rows — restores HDB to its original state |
 
 ## Tables Cleaned
 
@@ -64,6 +65,21 @@ $hdbs = (Invoke-Sqlcmd -ServerInstance "myserver" -Query "SELECT name FROM sys.d
 # Custom batch size
 .\Invoke-OIMHistoryCleanup.ps1 -SqlServer "myserver" -Database "OneIMHDB" -BatchSize 5000
 ```
+
+## Testing with Real HDBs
+
+The test scripts let you safely validate the cleanup against a **real History Database** without risking existing data. All test rows are tagged with a `TEST_CLEANUP_` prefix.
+
+```
+1. Edit create_test_data.sql → change USE [OneIMHDB] to your HDB
+2. Run create_test_data.sql   → inserts ~335K prefixed rows (spread over 4 years)
+3. Run cleanup_history.sql    → purges rows older than 2 years (real + test)
+4. Verify that old TEST_CLEANUP_ rows were deleted
+5. Run remove_test_data.sql   → removes ALL remaining TEST_CLEANUP_ rows
+6. Your HDB is back to its original state
+```
+
+> **Note:** The cleanup script purges by date, not by prefix — so it will also delete any real data older than 2 years. If you only want to test against the prefixed data, run the cleanup on an HDB that has no real data you need to keep, or adjust the retention period.
 
 ## ⚠️ Important
 
