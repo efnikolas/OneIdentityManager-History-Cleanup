@@ -62,9 +62,10 @@ The OIM History Database contains 20 tables in three categories:
 
 1. Open `cleanup_history.sql` in SQL Server Management Studio
 2. Change `USE [OneIMHDB]` to your History Database name
-3. Connect to the SQL Server hosting the HDB
-4. Run — the script prints a pre-flight summary, deletes old data in FK-safe order, and prints remaining counts
-5. Repeat for each HDB, or use the PowerShell wrapper for multiple databases
+3. (Optional) Set `@WhatIf = 1` and `@PreviewLimit` in the CONFIGURATION section to preview rows that would be deleted
+4. Connect to the SQL Server hosting the HDB
+5. Run — the script prints a pre-flight summary, deletes old data in FK-safe order, and prints remaining counts
+6. Repeat for each HDB, or use the PowerShell wrapper for multiple databases
 
 ### PowerShell Script (supports multiple HDBs)
 
@@ -123,6 +124,15 @@ The audit shows three sections:
 2. **Year-by-year breakdown** — row counts per year with PURGE / PARTIAL / KEEP labels so you can see exactly which years will be affected
 3. **Oldest 5 records** — spot-check the actual oldest rows in each table to confirm they're genuinely old data
 
+### SQL WhatIf Preview
+
+In `cleanup_history.sql`, set:
+
+- `@WhatIf = 1` to disable deletes
+- `@PreviewLimit = 0` to return *all* rows that would be deleted (or set a number to limit per table)
+
+This outputs result sets per table with the exact rows that match the cutoff.
+
 ## Testing with Real HDBs
 
 The test scripts let you safely validate the cleanup against a **real History Database** without risking existing data. All test rows use a `TEST_CLEANUP_` prefix.
@@ -138,7 +148,7 @@ The test scripts let you safely validate the cleanup against a **real History Da
 
 ## How It Works
 
-1. **Dynamic date column discovery** — each table is scanned for datetime columns, preferring `XDateInserted` > `XDateUpdated` > `StartDate` > `EndDate`
+1. **Dynamic date column discovery** — each table is scanned for datetime columns, preferring `OperationDate` > `FirstDate` > `XDateInserted` > `ThisDate` > `StartAt` > `ExportDate` > `XDateUpdated`
 2. **FK-safe delete order** — Raw child tables are deleted before their Aggregated parent tables
 3. **Batched deletes** — rows are deleted in configurable batches (default 10,000) with `CHECKPOINT` after each table to manage transaction log growth
 4. **Metadata protection** — `SourceColumn`, `SourceDatabase`, and `SourceTable` are never touched

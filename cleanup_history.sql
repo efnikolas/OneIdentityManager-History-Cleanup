@@ -37,12 +37,16 @@ GO
 DECLARE @CutoffDate DATETIME = DATEADD(YEAR, -2, GETDATE())
 DECLARE @BatchSize  INT      = 10000
 DECLARE @Deleted    INT
+DECLARE @WhatIf     BIT      = 0
+DECLARE @PreviewLimit INT    = 0  -- 0 = return all rows in WhatIf preview
 
 PRINT '================================================'
 PRINT 'OIM History Database Cleanup'
 PRINT 'Database:    ' + DB_NAME()
 PRINT 'Cutoff date: ' + CONVERT(VARCHAR(20), @CutoffDate, 120)
 PRINT 'Batch size:  ' + CAST(@BatchSize AS VARCHAR)
+PRINT 'WhatIf:      ' + CAST(@WhatIf AS VARCHAR)
+PRINT 'PreviewLimit:' + CAST(@PreviewLimit AS VARCHAR)
 PRINT '================================================'
 PRINT ''
 
@@ -221,10 +225,81 @@ INSERT INTO @DeleteOrder (TableName) VALUES ('WatchOperation')
 INSERT INTO @DeleteOrder (TableName) VALUES ('ProcessStep')
 INSERT INTO @DeleteOrder (TableName) VALUES ('ProcessSubstitute')
 INSERT INTO @DeleteOrder (TableName) VALUES ('ProcessChain')
-INSERT INTO @DeleteOrder (TableName) VALUES ('ProcessInfo')
-INSERT INTO @DeleteOrder (TableName) VALUES ('ProcessGroup')
 INSERT INTO @DeleteOrder (TableName) VALUES ('HistoryJob')
 INSERT INTO @DeleteOrder (TableName) VALUES ('HistoryChain')
+INSERT INTO @DeleteOrder (TableName) VALUES ('ProcessInfo')
+INSERT INTO @DeleteOrder (TableName) VALUES ('ProcessGroup')
+
+-- ============================================================
+-- WHATIF PREVIEW (optional)
+-- ============================================================
+IF @WhatIf = 1
+BEGIN
+    PRINT ''
+    PRINT '================================================'
+    PRINT '# WHATIF PREVIEW — Rows that WOULD be deleted'
+    PRINT '================================================'
+
+    DECLARE @TopClause NVARCHAR(50) = CASE WHEN @PreviewLimit > 0
+        THEN 'TOP (' + CAST(@PreviewLimit AS NVARCHAR(20)) + ') '
+        ELSE '' END
+
+    DECLARE preview_cur CURSOR LOCAL FAST_FORWARD FOR
+        SELECT TableName FROM @DeleteOrder ORDER BY Seq
+
+    OPEN preview_cur
+    FETCH NEXT FROM preview_cur INTO @TableName
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        IF OBJECT_ID(@TableName, 'U') IS NULL
+        BEGIN
+            FETCH NEXT FROM preview_cur INTO @TableName
+            CONTINUE
+        END
+
+        -- Determine date column for direct delete preview
+        SET @DateCol = NULL
+        SELECT @DateCol = DateColumn FROM @Tables WHERE TableName = @TableName
+
+        -- FK-join preview
+        IF EXISTS (SELECT 1 FROM @FKJoinDeletes WHERE ChildTable = @TableName AND ParentDateCol IS NOT NULL)
+        BEGIN
+            SELECT @FKChild = ChildTable, @FKParent = ParentTable,
+                   @FKChildCol = ChildFK, @FKParentCol = ParentPK,
+                   @FKDateCol = ParentDateCol
+            FROM @FKJoinDeletes WHERE ChildTable = @TableName
+
+            PRINT 'Preview ' + @TableName + ' (FK join -> ' + @FKParent + '.' + @FKDateCol + ' < cutoff)...'
+            SET @SQL = N'SELECT ' + @TopClause + N'''' + @TableName + N''' AS TableName, child.*, parent.[' + @FKDateCol + N'] AS ParentDate ' +
+                N'FROM [' + @TableName + N'] child ' +
+                N'INNER JOIN [' + @FKParent + N'] parent ON child.[' + @FKChildCol + N'] = parent.[' + @FKParentCol + N'] ' +
+                N'WHERE parent.[' + @FKDateCol + N'] < @cutoff ' +
+                N'ORDER BY parent.[' + @FKDateCol + N'] ASC'
+            EXEC sp_executesql @SQL, N'@cutoff DATETIME', @CutoffDate
+        END
+        ELSE IF @DateCol IS NOT NULL
+        BEGIN
+            PRINT 'Preview ' + @TableName + ' (WHERE ' + @DateCol + ' < cutoff)...'
+            SET @SQL = N'SELECT ' + @TopClause + N'''' + @TableName + N''' AS TableName, * FROM [' + @TableName + N'] ' +
+                N'WHERE [' + @DateCol + N'] < @cutoff ORDER BY [' + @DateCol + N'] ASC'
+            EXEC sp_executesql @SQL, N'@cutoff DATETIME', @CutoffDate
+        END
+        ELSE
+        BEGIN
+            PRINT 'SKIP ' + @TableName + ' (no date column and no FK-join rule)'
+        END
+
+        FETCH NEXT FROM preview_cur INTO @TableName
+    END
+    CLOSE preview_cur
+    DEALLOCATE preview_cur
+
+    PRINT ''
+    PRINT '================================================'
+    PRINT 'WhatIf preview complete. No data was deleted.'
+    PRINT '================================================'
+    RETURN
+END
 
 DECLARE @Seq INT = 1
 DECLARE @MaxSeq INT = (SELECT MAX(Seq) FROM @DeleteOrder)
