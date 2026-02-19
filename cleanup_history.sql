@@ -38,12 +38,13 @@ GO
 -- CONFIGURATION
 -- ============================================================
 DECLARE @CutoffDate        DATETIME    = DATEADD(YEAR, -2, GETDATE())
-DECLARE @BatchSize         INT         = 50000           -- ↑ raised from 10K for throughput
+DECLARE @BatchSize         INT         = 50000           -- starting default; overridden by benchmark if enabled
 DECLARE @Deleted           INT
 DECLARE @WhatIf            BIT         = 0
 DECLARE @PreviewLimit      INT         = 0               -- 0 = return all rows in WhatIf preview
 DECLARE @BatchDelay        VARCHAR(12) = '00:00:00'      -- pause between batches (HH:MM:SS), e.g. '00:00:01'
 DECLARE @CreateTempIndexes BIT         = 1               -- create temp non-clustered indexes on date cols before delete
+DECLARE @BenchmarkBatchSize BIT        = 1               -- auto-test batch sizes and pick fastest (set 0 to skip)
 
 PRINT '================================================'
 PRINT 'OIM History Database Cleanup'
@@ -52,6 +53,7 @@ PRINT 'Cutoff date: ' + CONVERT(VARCHAR(20), @CutoffDate, 120)
 PRINT 'Batch size:  ' + CAST(@BatchSize AS VARCHAR)
 PRINT 'Batch delay: ' + @BatchDelay
 PRINT 'Temp indexes:' + CAST(@CreateTempIndexes AS VARCHAR)
+PRINT 'Benchmark:   ' + CAST(@BenchmarkBatchSize AS VARCHAR)
 PRINT 'WhatIf:      ' + CAST(@WhatIf AS VARCHAR)
 PRINT 'PreviewLimit:' + CAST(@PreviewLimit AS VARCHAR)
 PRINT '================================================'
@@ -204,6 +206,155 @@ PRINT ''
 PRINT '================================================'
 PRINT '# CLEANUP'
 PRINT '================================================'
+
+-- ============================================================
+-- BENCHMARK: Test multiple batch sizes on the largest table
+-- to find the optimal throughput for this server's hardware.
+-- Deletes real rows (they need to go anyway) during the test.
+-- ============================================================
+IF @WhatIf = 0 AND @BenchmarkBatchSize = 1
+BEGIN
+    -- Find the table with the most rows to purge (best sample)
+    DECLARE @BenchTable   NVARCHAR(256)
+    DECLARE @BenchDateCol NVARCHAR(256)
+    DECLARE @BenchPurge   BIGINT
+
+    SELECT TOP 1 @BenchTable = t.TableName, @BenchDateCol = t.DateColumn
+    FROM @Tables t
+    CROSS APPLY (
+        SELECT COUNT(*) AS PurgeCount
+        FROM sys.objects o
+        WHERE o.object_id = OBJECT_ID(t.TableName)
+    ) x
+    ORDER BY t.TableName  -- placeholder; actual purge count below
+
+    -- Get actual purge count for the largest table
+    DECLARE @BenchSQL NVARCHAR(MAX)
+    DECLARE @BestRate BIGINT = 0
+    DECLARE @BestSize INT   = @BatchSize
+
+    -- Find table with most rows to purge
+    DECLARE @BenchCandidates TABLE (TableName NVARCHAR(256), DateColumn NVARCHAR(256), PurgeCount BIGINT)
+    DECLARE @BenchTbl NVARCHAR(256), @BenchCol NVARCHAR(256)
+    DECLARE @BenchCnt BIGINT
+
+    DECLARE bench_disco CURSOR LOCAL FAST_FORWARD FOR
+        SELECT TableName, DateColumn FROM @Tables
+    OPEN bench_disco
+    FETCH NEXT FROM bench_disco INTO @BenchTbl, @BenchCol
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        SET @BenchSQL = N'SELECT @cnt = COUNT(*) FROM [' + @BenchTbl + N'] WHERE [' + @BenchCol + N'] < @cutoff'
+        SET @BenchCnt = 0
+        EXEC sp_executesql @BenchSQL, N'@cutoff DATETIME, @cnt BIGINT OUTPUT', @CutoffDate, @BenchCnt OUTPUT
+        INSERT INTO @BenchCandidates VALUES (@BenchTbl, @BenchCol, @BenchCnt)
+        FETCH NEXT FROM bench_disco INTO @BenchTbl, @BenchCol
+    END
+    CLOSE bench_disco
+    DEALLOCATE bench_disco
+
+    SELECT TOP 1 @BenchTable = TableName, @BenchDateCol = DateColumn, @BenchPurge = PurgeCount
+    FROM @BenchCandidates ORDER BY PurgeCount DESC
+
+    IF @BenchPurge >= 100000  -- need enough rows for a meaningful test
+    BEGIN
+        PRINT ''
+        PRINT '================================================'
+        PRINT '# BATCH SIZE BENCHMARK'
+        PRINT '================================================'
+        PRINT 'Target table: ' + @BenchTable + ' (' + CAST(@BenchPurge AS VARCHAR) + ' rows to purge)'
+        PRINT 'Date column:  ' + @BenchDateCol
+        PRINT ''
+        PRINT 'Testing batch sizes (3 trial batches each)...'
+        PRINT '------------------------------------------------'
+
+        DECLARE @TestSizes TABLE (TestSize INT)
+        INSERT INTO @TestSizes VALUES (5000),(10000),(25000),(50000),(100000),(250000),(500000)
+
+        DECLARE @TestSize      INT
+        DECLARE @TrialBatches  INT = 3
+        DECLARE @TrialDeleted  INT
+        DECLARE @TrialTotal    BIGINT
+        DECLARE @TrialStart    DATETIME
+        DECLARE @TrialMs       BIGINT
+        DECLARE @TrialRate     BIGINT
+
+        DECLARE bench_cur CURSOR LOCAL FAST_FORWARD FOR
+            SELECT TestSize FROM @TestSizes ORDER BY TestSize
+        OPEN bench_cur
+        FETCH NEXT FROM bench_cur INTO @TestSize
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            -- Skip sizes larger than remaining rows
+            SET @BenchSQL = N'SELECT @cnt = COUNT(*) FROM [' + @BenchTable + N'] WHERE [' + @BenchDateCol + N'] < @cutoff'
+            SET @BenchCnt = 0
+            EXEC sp_executesql @BenchSQL, N'@cutoff DATETIME, @cnt BIGINT OUTPUT', @CutoffDate, @BenchCnt OUTPUT
+
+            IF @BenchCnt < @TestSize
+            BEGIN
+                PRINT '  ' + CAST(@TestSize AS VARCHAR(10)) + ': SKIP (only ' + CAST(@BenchCnt AS VARCHAR) + ' rows remain)'
+                FETCH NEXT FROM bench_cur INTO @TestSize
+                CONTINUE
+            END
+
+            SET @TrialTotal = 0
+            SET @TrialStart = GETDATE()
+
+            DECLARE @Trial INT = 0
+            WHILE @Trial < @TrialBatches
+            BEGIN
+                SET @BenchSQL = N'DELETE TOP (' + CAST(@TestSize AS NVARCHAR) + N') FROM [' + @BenchTable + N'] WHERE [' + @BenchDateCol + N'] < @cutoff'
+                EXEC sp_executesql @BenchSQL, N'@cutoff DATETIME', @CutoffDate
+                SET @TrialDeleted = @@ROWCOUNT
+                SET @TrialTotal = @TrialTotal + @TrialDeleted
+                CHECKPOINT
+                IF @TrialDeleted = 0 BREAK
+                SET @Trial = @Trial + 1
+            END
+
+            SET @TrialMs = DATEDIFF(MILLISECOND, @TrialStart, GETDATE())
+            SET @TrialRate = CASE WHEN @TrialMs > 0 THEN (@TrialTotal * 1000) / @TrialMs ELSE 0 END
+
+            DECLARE @EstHours VARCHAR(20) = ''
+            IF @TrialRate > 0
+            BEGIN
+                DECLARE @EstSec BIGINT = (@BenchPurge - @TrialTotal) / @TrialRate
+                SET @EstHours = CAST(@EstSec / 3600 AS VARCHAR) + 'h ' + CAST((@EstSec % 3600) / 60 AS VARCHAR) + 'm'
+            END
+
+            PRINT '  ' + RIGHT('       ' + CAST(@TestSize AS VARCHAR(10)), 7) +
+                  ': ' + CAST(@TrialTotal AS VARCHAR) + ' rows in ' + CAST(@TrialMs AS VARCHAR) + 'ms' +
+                  ' = ~' + CAST(@TrialRate AS VARCHAR) + ' rows/sec' +
+                  '  (est. total: ' + @EstHours + ')'
+
+            IF @TrialRate > @BestRate
+            BEGIN
+                SET @BestRate = @TrialRate
+                SET @BestSize = @TestSize
+            END
+
+            FETCH NEXT FROM bench_cur INTO @TestSize
+        END
+        CLOSE bench_cur
+        DEALLOCATE bench_cur
+
+        PRINT '------------------------------------------------'
+        PRINT 'Winner: ' + CAST(@BestSize AS VARCHAR) + ' rows/batch (~' + CAST(@BestRate AS VARCHAR) + ' rows/sec)'
+
+        -- Apply the winning batch size
+        SET @BatchSize = @BestSize
+        PRINT 'Using @BatchSize = ' + CAST(@BatchSize AS VARCHAR) + ' for remaining cleanup.'
+        PRINT '================================================'
+        PRINT ''
+    END
+    ELSE
+    BEGIN
+        PRINT ''
+        PRINT 'Benchmark skipped: largest table has < 100K rows to purge (' + CAST(ISNULL(@BenchPurge, 0) AS VARCHAR) + ')'
+        PRINT 'Using default @BatchSize = ' + CAST(@BatchSize AS VARCHAR)
+        PRINT ''
+    END
+END
 
 -- ============================================================
 -- HELPER: Create temp indexes on date columns to avoid
@@ -379,7 +530,7 @@ BEGIN
     -- Check if this table uses FK-join delete (no date column)
     IF EXISTS (SELECT 1 FROM @FKJoinDeletes WHERE ChildTable = @TableName AND ParentDateCol IS NOT NULL)
     BEGIN
-        -- FK-join delete
+        -- FK-join delete: materialize keys into temp table, then delete by key
         SELECT @FKChild = ChildTable, @FKParent = ParentTable,
                @FKChildCol = ChildFK, @FKParentCol = ParentPK,
                @FKDateCol = ParentDateCol
@@ -387,34 +538,52 @@ BEGIN
 
         PRINT 'Cleaning ' + @TableName + ' (FK join -> ' + @FKParent + '.' + @FKDateCol + ' < cutoff)...'
         BEGIN TRY
-            SET @Deleted = 1
-            DECLARE @FKTotalDeleted BIGINT = 0
-            DECLARE @FKStartTime   DATETIME = GETDATE()
-            WHILE @Deleted > 0
-            BEGIN
-                SET @SQL = N'DELETE TOP (' + CAST(@BatchSize AS NVARCHAR) + N') child FROM [' + @TableName + N'] child ' +
-                    N'INNER JOIN [' + @FKParent + N'] parent ON child.[' + @FKChildCol + N'] = parent.[' + @FKParentCol + N'] ' +
-                    N'WHERE parent.[' + @FKDateCol + N'] < @cutoff'
-                EXEC sp_executesql @SQL, N'@cutoff DATETIME', @CutoffDate
-                SET @Deleted = @@ROWCOUNT
-                SET @FKTotalDeleted = @FKTotalDeleted + @Deleted
-                IF @Deleted > 0
-                BEGIN
-                    CHECKPOINT
-                    DECLARE @FKElapsedSec INT = DATEDIFF(SECOND, @FKStartTime, GETDATE())
-                    DECLARE @FKRate       BIGINT = CASE WHEN @FKElapsedSec > 0 THEN @FKTotalDeleted / @FKElapsedSec ELSE 0 END
-                    PRINT '  Deleted batch: ' + CAST(@Deleted AS VARCHAR) +
-                          ' | total: ' + CAST(@FKTotalDeleted AS VARCHAR) +
-                          ' | ' + CAST(@FKElapsedSec AS VARCHAR) + 's elapsed' +
-                          ' | ~' + CAST(@FKRate AS VARCHAR) + ' rows/sec'
-                    IF @BatchDelay <> '00:00:00'
-                        WAITFOR DELAY @BatchDelay
-                END
-            END
-            PRINT '  Done. ' + CAST(@FKTotalDeleted AS VARCHAR) + ' rows removed.'
+            -- Step 1: Collect all child keys to delete into a temp table (one-time join)
+            IF OBJECT_ID('tempdb..#FKKeysToDelete') IS NOT NULL DROP TABLE #FKKeysToDelete
+
+            SET @SQL = N'SELECT child.[' + @FKChildCol + N'] AS KeyVal ' +
+                N'INTO #FKKeysToDelete ' +
+                N'FROM [' + @TableName + N'] child ' +
+                N'INNER JOIN [' + @FKParent + N'] parent ON child.[' + @FKChildCol + N'] = parent.[' + @FKParentCol + N'] ' +
+                N'WHERE parent.[' + @FKDateCol + N'] < @cutoff; ' +
+                N'SELECT @@ROWCOUNT AS KeyCount'
+            DECLARE @KeyCount BIGINT = 0
+            -- We need real temp table so we use a different approach: build + exec
+            SET @SQL = N'SELECT child.[' + @FKChildCol + N'] AS KeyVal ' +
+                N'INTO #FKKeysToDelete ' +
+                N'FROM [' + @TableName + N'] child ' +
+                N'INNER JOIN [' + @FKParent + N'] parent ON child.[' + @FKChildCol + N'] = parent.[' + @FKParentCol + N'] ' +
+                N'WHERE parent.[' + @FKDateCol + N'] < @cutoff; ' +
+                N'' +
+                N'CREATE CLUSTERED INDEX IX_FKKeys ON #FKKeysToDelete (KeyVal); ' +
+                N'' +
+                N'DECLARE @d INT = 1, @tot BIGINT = 0, @st DATETIME = GETDATE(); ' +
+                N'DECLARE @kc BIGINT = (SELECT COUNT(*) FROM #FKKeysToDelete); ' +
+                N'PRINT ''  Collected '' + CAST(@kc AS VARCHAR) + '' keys to delete''; ' +
+                N'' +
+                N'WHILE @d > 0 ' +
+                N'BEGIN ' +
+                N'  DELETE TOP (' + CAST(@BatchSize AS NVARCHAR) + N') t ' +
+                N'  FROM [' + @TableName + N'] t ' +
+                N'  INNER JOIN #FKKeysToDelete k ON t.[' + @FKChildCol + N'] = k.KeyVal; ' +
+                N'  SET @d = @@ROWCOUNT; ' +
+                N'  SET @tot = @tot + @d; ' +
+                N'  IF @d > 0 BEGIN ' +
+                N'    CHECKPOINT; ' +
+                N'    DECLARE @sec INT = DATEDIFF(SECOND, @st, GETDATE()); ' +
+                N'    DECLARE @r BIGINT = CASE WHEN @sec > 0 THEN @tot / @sec ELSE 0 END; ' +
+                N'    DECLARE @pct INT = CASE WHEN @kc > 0 THEN (@tot * 100) / @kc ELSE 0 END; ' +
+                N'    PRINT ''  Deleted batch: '' + CAST(@d AS VARCHAR) + '' | total: '' + CAST(@tot AS VARCHAR) + ''/'' + CAST(@kc AS VARCHAR) + '' ('' + CAST(@pct AS VARCHAR) + ''%)'' + '' | '' + CAST(@sec AS VARCHAR) + ''s elapsed | ~'' + CAST(@r AS VARCHAR) + '' rows/sec''; ' +
+                N'    IF ''' + @BatchDelay + N''' <> ''00:00:00'' WAITFOR DELAY ''' + @BatchDelay + N'''; ' +
+                N'  END ' +
+                N'END; ' +
+                N'PRINT ''  Done. '' + CAST(@tot AS VARCHAR) + '' rows removed.''; ' +
+                N'DROP TABLE #FKKeysToDelete;'
+            EXEC sp_executesql @SQL, N'@cutoff DATETIME', @CutoffDate
         END TRY
         BEGIN CATCH
             PRINT '  ERROR: ' + ERROR_MESSAGE()
+            IF OBJECT_ID('tempdb..#FKKeysToDelete') IS NOT NULL DROP TABLE #FKKeysToDelete
         END CATCH
     END
     ELSE IF @DateCol IS NOT NULL

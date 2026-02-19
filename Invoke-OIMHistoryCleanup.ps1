@@ -40,6 +40,8 @@ param(
 
     [int]$BatchDelaySec = 0,
 
+    [switch]$BenchmarkBatchSize,
+
     [switch]$CreateTempIndexes,
 
     [switch]$Encrypt,
@@ -137,6 +139,7 @@ Write-Log "Cutoff:      $CutoffDate (retain last $RetentionYears years)"
 Write-Log "BatchSize:   $BatchSize"
 Write-Log "BatchDelay:  ${BatchDelaySec}s"
 Write-Log "TempIndexes: $CreateTempIndexes"
+Write-Log "Benchmark:   $BenchmarkBatchSize"
 Write-Log "Encrypt:     $Encrypt"
 Write-Log "TrustCert:   $TrustServerCertificate"
 Write-Log "WhatIf:      $WhatIf"
@@ -307,6 +310,85 @@ foreach ($db in $Database) {
         }
     }
 
+    # ── Benchmark batch sizes on the largest table ──
+    if ($BenchmarkBatchSize) {
+        Write-Log "" "White"
+        Write-Log "  =============================================" "Cyan"
+        Write-Log "  BATCH SIZE BENCHMARK" "Cyan"
+        Write-Log "  =============================================" "Cyan"
+
+        # Find the table with the most rows to purge
+        $benchBest = $null
+        foreach ($row in $tableInfo) {
+            $tbl = $row.TableName; $col = $row.DateColumn
+            try {
+                $cntResult = Invoke-Sqlcmd @connParams -Database $db -Query "SELECT COUNT(*) AS Cnt FROM [$tbl] WHERE [$col] < '$cutoffStr'"
+                if (-not $benchBest -or $cntResult.Cnt -gt $benchBest.PurgeCount) {
+                    $benchBest = @{ TableName = $tbl; DateColumn = $col; PurgeCount = $cntResult.Cnt }
+                }
+            } catch { }
+        }
+
+        if ($benchBest -and $benchBest.PurgeCount -ge 100000) {
+            Write-Log "  Target: $($benchBest.TableName) ($($benchBest.PurgeCount) rows to purge by $($benchBest.DateColumn))" "Cyan"
+            Write-Log "  Testing 3 trial batches per size..." "White"
+            Write-Log "  ------------------------------------------------" "White"
+
+            $testSizes = @(5000, 10000, 25000, 50000, 100000, 250000, 500000)
+            $bestRate = 0
+            $bestSize = $BatchSize
+
+            foreach ($testSize in $testSizes) {
+                # Check if enough rows remain
+                try {
+                    $remResult = Invoke-Sqlcmd @connParams -Database $db -Query "SELECT COUNT(*) AS Cnt FROM [$($benchBest.TableName)] WHERE [$($benchBest.DateColumn)] < '$cutoffStr'"
+                    if ($remResult.Cnt -lt $testSize) {
+                        Write-Log ("  {0,7}: SKIP (only {1} rows remain)" -f $testSize, $remResult.Cnt) "DarkGray"
+                        continue
+                    }
+                } catch { continue }
+
+                $sw = [System.Diagnostics.Stopwatch]::StartNew()
+                $trialTotal = 0
+                for ($trial = 0; $trial -lt 3; $trial++) {
+                    try {
+                        $delQuery = "SET NOCOUNT ON; DELETE TOP ($testSize) FROM [$($benchBest.TableName)] WHERE [$($benchBest.DateColumn)] < '$cutoffStr'; CHECKPOINT; SELECT @@ROWCOUNT AS Deleted;"
+                        $delR = Invoke-Sqlcmd @connParams -Database $db -Query $delQuery
+                        $trialTotal += $delR.Deleted
+                        if ($delR.Deleted -eq 0) { break }
+                    } catch { break }
+                }
+                $sw.Stop()
+                $elapsedMs = $sw.ElapsedMilliseconds
+                $rate = if ($elapsedMs -gt 0) { [math]::Round(($trialTotal * 1000) / $elapsedMs) } else { 0 }
+
+                $estRemaining = $benchBest.PurgeCount - $trialTotal
+                $estStr = if ($rate -gt 0) {
+                    $estSec = [math]::Round($estRemaining / $rate)
+                    "{0}h {1}m" -f [math]::Floor($estSec / 3600), [math]::Floor(($estSec % 3600) / 60)
+                } else { "?" }
+
+                Write-Log ("  {0,7}: {1} rows in {2}ms = ~{3} rows/sec  (est. total: {4})" -f $testSize, $trialTotal, $elapsedMs, $rate, $estStr) "White"
+
+                if ($rate -gt $bestRate) {
+                    $bestRate = $rate
+                    $bestSize = $testSize
+                }
+            }
+
+            Write-Log "  ------------------------------------------------" "White"
+            Write-Log "  Winner: $bestSize rows/batch (~$bestRate rows/sec)" "Green"
+            $BatchSize = $bestSize
+            Write-Log "  Using BatchSize = $BatchSize for remaining cleanup." "Cyan"
+            Write-Log "  =============================================" "Cyan"
+        }
+        else {
+            $cnt = if ($benchBest) { $benchBest.PurgeCount } else { 0 }
+            Write-Log "  Benchmark skipped: largest table has < 100K rows to purge ($cnt)" "Yellow"
+            Write-Log "  Using default BatchSize = $BatchSize" "Yellow"
+        }
+    }
+
     # Delete in FK-safe order
     Write-Log "" "White"
     Write-Log "  Deleting..." "White"
@@ -333,27 +415,38 @@ foreach ($db in $Database) {
             $totalDeleted = 0
 
             if ($isFkJoin -and $fkJoinDeletes[$tbl].ParentDateCol) {
-                # ── FK-join delete (no date column on this table) ──
+                # ── FK-join delete: materialize keys, index, delete by key — all in one session ──
                 $fk = $fkJoinDeletes[$tbl]
+
+                # Single multi-statement batch: collect keys → index → batched delete → cleanup
+                # This avoids temp table scope issues across Invoke-Sqlcmd calls.
+                $fkBatchQuery = "SET NOCOUNT ON; " +
+                    "SELECT child.[$($fk.ChildFK)] AS KeyVal " +
+                    "INTO #FKKeysToDelete " +
+                    "FROM [$tbl] child " +
+                    "INNER JOIN [$($fk.ParentTable)] parent " +
+                    "ON child.[$($fk.ChildFK)] = parent.[$($fk.ParentPK)] " +
+                    "WHERE parent.[$($fk.ParentDateCol)] < '$cutoffStr'; " +
+                    "CREATE CLUSTERED INDEX IX_FKKeys ON #FKKeysToDelete (KeyVal); " +
+                    "DECLARE @kc BIGINT = (SELECT COUNT(*) FROM #FKKeysToDelete); " +
+                    "DECLARE @d INT = 1, @tot BIGINT = 0, @st DATETIME = GETDATE(); " +
+                    "WHILE @d > 0 BEGIN " +
+                    "  DELETE TOP ($BatchSize) t FROM [$tbl] t INNER JOIN #FKKeysToDelete k ON t.[$($fk.ChildFK)] = k.KeyVal; " +
+                    "  SET @d = @@ROWCOUNT; SET @tot = @tot + @d; " +
+                    "  IF @d > 0 CHECKPOINT; " +
+                    "END; " +
+                    "DROP TABLE #FKKeysToDelete; " +
+                    "SELECT @kc AS KeyCount, @tot AS TotalDeleted, DATEDIFF(SECOND, @st, GETDATE()) AS ElapsedSec;"
+
+                Write-Log "    $tbl : collecting keys via FK join (one-time)..." "DarkCyan"
                 $sw = [System.Diagnostics.Stopwatch]::StartNew()
-                do {
-                    $deleteQuery = "SET NOCOUNT ON; " +
-                        "DELETE TOP ($BatchSize) child FROM [$tbl] child " +
-                        "INNER JOIN [$($fk.ParentTable)] parent " +
-                        "ON child.[$($fk.ChildFK)] = parent.[$($fk.ParentPK)] " +
-                        "WHERE parent.[$($fk.ParentDateCol)] < '$cutoffStr'; " +
-                        "CHECKPOINT; " +
-                        "SELECT @@ROWCOUNT AS Deleted;"
-                    $delResult = Invoke-Sqlcmd @connParams -Database $db -Query $deleteQuery
-                    $deleted = $delResult.Deleted
-                    $totalDeleted += $deleted
-                    if ($deleted -gt 0) {
-                        $elapsed = [math]::Round($sw.Elapsed.TotalSeconds, 1)
-                        $rate = if ($elapsed -gt 0) { [math]::Round($totalDeleted / $elapsed) } else { 0 }
-                        Write-Log "    $tbl : batch $deleted ($totalDeleted total) | ${elapsed}s | ~${rate} rows/sec [FK join]" "DarkGray"
-                        if ($BatchDelaySec -gt 0) { Start-Sleep -Seconds $BatchDelaySec }
-                    }
-                } while ($deleted -eq $BatchSize)
+                $fkResult = Invoke-Sqlcmd @connParams -Database $db -Query $fkBatchQuery -QueryTimeout 0
+                $sw.Stop()
+                $keyCount = $fkResult.KeyCount
+                $totalDeleted = $fkResult.TotalDeleted
+                $elapsed = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+                $rate = if ($elapsed -gt 0) { [math]::Round($totalDeleted / $elapsed) } else { 0 }
+                Write-Log "    $tbl : $totalDeleted/$keyCount keys deleted | ${elapsed}s | ~${rate} rows/sec" "DarkGray"
             }
             elseif ($hasDateCol) {
                 # ── Direct date-column delete ──
