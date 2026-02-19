@@ -235,6 +235,22 @@ foreach ($db in $Database) {
     if (-not $WhatIf -and $CreateTempIndexes) {
         Write-Log "" "White"
         Write-Log "  Creating temp indexes on date columns..." "Cyan"
+
+        # First, clean up any stale IX_Cleanup_* indexes left from prior cancelled runs
+        try {
+            $staleQuery = "SELECT i.name AS IdxName, OBJECT_NAME(i.object_id) AS TblName " +
+                "FROM sys.indexes i WHERE i.name LIKE 'IX_Cleanup_%' AND i.type = 2"
+            $staleIndexes = Invoke-Sqlcmd @connParams -Database $db -Query $staleQuery
+            foreach ($si in $staleIndexes) {
+                try {
+                    Invoke-Sqlcmd @connParams -Database $db -Query "DROP INDEX [$($si.IdxName)] ON [$($si.TblName)]"
+                    Write-Log "    Dropped stale index $($si.IdxName) on $($si.TblName)" "DarkGray"
+                } catch {
+                    Write-Log "    WARN Could not drop stale $($si.IdxName): $($_.Exception.Message)" "Yellow"
+                }
+            }
+        } catch { }
+
         foreach ($row in $tableInfo) {
             $tbl = $row.TableName
             $col = $row.DateColumn

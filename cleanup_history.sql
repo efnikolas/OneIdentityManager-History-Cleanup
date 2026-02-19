@@ -164,6 +164,30 @@ BEGIN
     PRINT '# TEMP INDEX CREATION'
     PRINT '================================================'
 
+    -- First, clean up any stale IX_Cleanup_* indexes left from prior cancelled runs
+    DECLARE @StaleIdx NVARCHAR(256), @StaleTbl NVARCHAR(256)
+    DECLARE stale_cur CURSOR LOCAL FAST_FORWARD FOR
+        SELECT i.name, OBJECT_NAME(i.object_id)
+        FROM sys.indexes i
+        WHERE i.name LIKE 'IX_Cleanup_%'
+          AND i.type = 2 -- nonclustered
+    OPEN stale_cur
+    FETCH NEXT FROM stale_cur INTO @StaleIdx, @StaleTbl
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        BEGIN TRY
+            SET @IdxSQL = N'DROP INDEX [' + @StaleIdx + N'] ON [' + @StaleTbl + N']'
+            EXEC sp_executesql @IdxSQL
+            PRINT '  Dropped stale index ' + @StaleIdx + ' on ' + @StaleTbl
+        END TRY
+        BEGIN CATCH
+            PRINT '  WARN Could not drop stale ' + @StaleIdx + ': ' + ERROR_MESSAGE()
+        END CATCH
+        FETCH NEXT FROM stale_cur INTO @StaleIdx, @StaleTbl
+    END
+    CLOSE stale_cur
+    DEALLOCATE stale_cur
+
     DECLARE idx_cur CURSOR LOCAL FAST_FORWARD FOR
         SELECT TableName, DateColumn FROM @Tables
 
@@ -202,6 +226,43 @@ BEGIN
     END
     CLOSE idx_cur
     DEALLOCATE idx_cur
+
+    -- Also create indexes on FK child columns for FK-join deletes
+    -- (e.g. WatchProperty.UID_DialogWatchOperation) to speed up join-based deletes
+    DECLARE @FKIdxChild NVARCHAR(256), @FKIdxCol NVARCHAR(256)
+    DECLARE fk_idx_cur CURSOR LOCAL FAST_FORWARD FOR
+        SELECT ChildTable, ChildFK FROM @FKJoinDeletes WHERE ParentDateCol IS NOT NULL
+    OPEN fk_idx_cur
+    FETCH NEXT FROM fk_idx_cur INTO @FKIdxChild, @FKIdxCol
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        IF OBJECT_ID(@FKIdxChild, 'U') IS NOT NULL
+        AND NOT EXISTS (
+            SELECT 1 FROM sys.index_columns ic
+            INNER JOIN sys.indexes i ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+            WHERE ic.object_id = OBJECT_ID(@FKIdxChild)
+              AND ic.column_id = (SELECT column_id FROM sys.columns WHERE object_id = OBJECT_ID(@FKIdxChild) AND name = @FKIdxCol)
+              AND ic.key_ordinal = 1
+        )
+        BEGIN
+            DECLARE @FKIdxName NVARCHAR(256) = N'IX_Cleanup_' + @FKIdxChild + N'_' + @FKIdxCol
+            PRINT '  Creating FK child index ' + @FKIdxName + '...'
+            SET @IdxSQL = N'CREATE NONCLUSTERED INDEX [' + @FKIdxName + N'] ON [' + @FKIdxChild + N'] ([' + @FKIdxCol + N'])'
+            BEGIN TRY
+                EXEC sp_executesql @IdxSQL
+                INSERT INTO @TempIndexes (IndexName, TableName) VALUES (@FKIdxName, @FKIdxChild)
+                PRINT '  OK ' + @FKIdxName
+            END TRY
+            BEGIN CATCH
+                PRINT '  WARN Could not create index ' + @FKIdxName + ': ' + ERROR_MESSAGE()
+            END CATCH
+        END
+        ELSE IF OBJECT_ID(@FKIdxChild, 'U') IS NOT NULL
+            PRINT '  Index already exists on ' + @FKIdxChild + '.' + @FKIdxCol + ' -- skipping'
+        FETCH NEXT FROM fk_idx_cur INTO @FKIdxChild, @FKIdxCol
+    END
+    CLOSE fk_idx_cur
+    DEALLOCATE fk_idx_cur
 
     PRINT ''
 END
@@ -551,7 +612,9 @@ BEGIN
     -- Check if this table uses FK-join delete (no date column)
     IF EXISTS (SELECT 1 FROM @FKJoinDeletes WHERE ChildTable = @TableName AND ParentDateCol IS NOT NULL)
     BEGIN
-        -- FK-join delete: materialize keys into temp table, then delete by key
+        -- FK-join delete: direct batched JOIN delete (no upfront materialization)
+        -- At scale (627M+ child rows), materializing all keys into a temp table
+        -- is itself the bottleneck. Instead, delete directly via JOIN in batches.
         SELECT @FKChild = ChildTable, @FKParent = ParentTable,
                @FKChildCol = ChildFK, @FKParentCol = ParentPK,
                @FKDateCol = ParentDateCol
@@ -559,52 +622,29 @@ BEGIN
 
         PRINT 'Cleaning ' + @TableName + ' (FK join -> ' + @FKParent + '.' + @FKDateCol + ' < cutoff)...'
         BEGIN TRY
-            -- Step 1: Collect all child keys to delete into a temp table (one-time join)
-            IF OBJECT_ID('tempdb..#FKKeysToDelete') IS NOT NULL DROP TABLE #FKKeysToDelete
-
-            SET @SQL = N'SELECT child.[' + @FKChildCol + N'] AS KeyVal ' +
-                N'INTO #FKKeysToDelete ' +
-                N'FROM [' + @TableName + N'] child ' +
-                N'INNER JOIN [' + @FKParent + N'] parent ON child.[' + @FKChildCol + N'] = parent.[' + @FKParentCol + N'] ' +
-                N'WHERE parent.[' + @FKDateCol + N'] < @cutoff; ' +
-                N'SELECT @@ROWCOUNT AS KeyCount'
-            DECLARE @KeyCount BIGINT = 0
-            -- We need real temp table so we use a different approach: build + exec
-            SET @SQL = N'SELECT child.[' + @FKChildCol + N'] AS KeyVal ' +
-                N'INTO #FKKeysToDelete ' +
-                N'FROM [' + @TableName + N'] child ' +
-                N'INNER JOIN [' + @FKParent + N'] parent ON child.[' + @FKChildCol + N'] = parent.[' + @FKParentCol + N'] ' +
-                N'WHERE parent.[' + @FKDateCol + N'] < @cutoff; ' +
-                N'' +
-                N'CREATE CLUSTERED INDEX IX_FKKeys ON #FKKeysToDelete (KeyVal); ' +
-                N'' +
-                N'DECLARE @d INT = 1, @tot BIGINT = 0, @st DATETIME = GETDATE(); ' +
-                N'DECLARE @kc BIGINT = (SELECT COUNT(*) FROM #FKKeysToDelete); ' +
-                N'PRINT ''  Collected '' + CAST(@kc AS VARCHAR) + '' keys to delete''; ' +
-                N'' +
+            SET @SQL = N'DECLARE @d INT = 1, @tot BIGINT = 0, @st DATETIME = GETDATE(); ' +
                 N'WHILE @d > 0 ' +
                 N'BEGIN ' +
-                N'  DELETE TOP (' + CAST(@BatchSize AS NVARCHAR) + N') t ' +
-                N'  FROM [' + @TableName + N'] t ' +
-                N'  INNER JOIN #FKKeysToDelete k ON t.[' + @FKChildCol + N'] = k.KeyVal; ' +
+                N'  DELETE TOP (' + CAST(@BatchSize AS NVARCHAR) + N') child ' +
+                N'  FROM [' + @TableName + N'] child ' +
+                N'  INNER JOIN [' + @FKParent + N'] parent ' +
+                N'  ON child.[' + @FKChildCol + N'] = parent.[' + @FKParentCol + N'] ' +
+                N'  WHERE parent.[' + @FKDateCol + N'] < @cutoff; ' +
                 N'  SET @d = @@ROWCOUNT; ' +
                 N'  SET @tot = @tot + @d; ' +
                 N'  IF @d > 0 BEGIN ' +
                 N'    CHECKPOINT; ' +
                 N'    DECLARE @sec INT = DATEDIFF(SECOND, @st, GETDATE()); ' +
                 N'    DECLARE @r BIGINT = CASE WHEN @sec > 0 THEN @tot / @sec ELSE 0 END; ' +
-                N'    DECLARE @pct INT = CASE WHEN @kc > 0 THEN (@tot * 100) / @kc ELSE 0 END; ' +
-                N'    PRINT ''  Deleted batch: '' + CAST(@d AS VARCHAR) + '' | total: '' + CAST(@tot AS VARCHAR) + ''/'' + CAST(@kc AS VARCHAR) + '' ('' + CAST(@pct AS VARCHAR) + ''%)'' + '' | '' + CAST(@sec AS VARCHAR) + ''s elapsed | ~'' + CAST(@r AS VARCHAR) + '' rows/sec''; ' +
+                N'    PRINT ''  Deleted batch: '' + CAST(@d AS VARCHAR) + '' | total: '' + CAST(@tot AS VARCHAR) + '' | '' + CAST(@sec AS VARCHAR) + ''s elapsed | ~'' + CAST(@r AS VARCHAR) + '' rows/sec''; ' +
                 N'    IF ''' + @BatchDelay + N''' <> ''00:00:00'' WAITFOR DELAY ''' + @BatchDelay + N'''; ' +
                 N'  END ' +
                 N'END; ' +
-                N'PRINT ''  Done. '' + CAST(@tot AS VARCHAR) + '' rows removed.''; ' +
-                N'DROP TABLE #FKKeysToDelete;'
+                N'PRINT ''  Done. '' + CAST(@tot AS VARCHAR) + '' rows removed.''; '
             EXEC sp_executesql @SQL, N'@cutoff DATETIME', @CutoffDate
         END TRY
         BEGIN CATCH
             PRINT '  ERROR: ' + ERROR_MESSAGE()
-            IF OBJECT_ID('tempdb..#FKKeysToDelete') IS NOT NULL DROP TABLE #FKKeysToDelete
         END CATCH
     END
     ELSE IF @DateCol IS NOT NULL
