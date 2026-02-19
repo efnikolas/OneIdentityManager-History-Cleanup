@@ -30,16 +30,16 @@ DECLARE @CutoffDate  DATETIME = DATEADD(YEAR, -2, GETDATE())
 DECLARE @WhatIf      BIT      = 0        -- 1 = print counts only
 -- ────────────────────────────────────────────────────────────
 
-PRINT '================================================'
-PRINT 'HDB Cleanup (TRUNCATE) — ' + DB_NAME()
-PRINT 'Cutoff:  ' + CONVERT(VARCHAR, @CutoffDate, 120)
-PRINT 'WhatIf:  ' + CAST(@WhatIf AS VARCHAR)
-PRINT '================================================'
-PRINT ''
+RAISERROR('================================================', 0, 1) WITH NOWAIT
+RAISERROR('HDB Cleanup (TRUNCATE) — %s', 0, 1, DB_NAME()) WITH NOWAIT
+RAISERROR('Cutoff:  %s', 0, 1, CONVERT(VARCHAR, @CutoffDate, 120)) WITH NOWAIT
+RAISERROR('WhatIf:  %s', 0, 1, CAST(@WhatIf AS VARCHAR)) WITH NOWAIT
+RAISERROR('================================================', 0, 1) WITH NOWAIT
+RAISERROR(' ', 0, 1) WITH NOWAIT
 
 -- ── PRE-FLIGHT: show what will be kept vs removed ───────────
-PRINT '# PRE-FLIGHT'
-PRINT '------------------------------------------------'
+RAISERROR('# PRE-FLIGHT', 0, 1) WITH NOWAIT
+RAISERROR('------------------------------------------------', 0, 1) WITH NOWAIT
 
 DECLARE @total   BIGINT
 DECLARE @keep    BIGINT
@@ -49,7 +49,7 @@ DECLARE @remove  BIGINT
 SELECT @total = COUNT_BIG(*) FROM WatchOperation
 SELECT @keep  = COUNT_BIG(*) FROM WatchOperation WHERE OperationDate >= @CutoffDate
 SET @remove = @total - @keep
-PRINT 'WatchOperation:   ' + CAST(@total AS VARCHAR) + ' total | ' + CAST(@keep AS VARCHAR) + ' keep | ' + CAST(@remove AS VARCHAR) + ' remove'
+RAISERROR('WatchOperation:   %I64d total | %I64d keep | %I64d remove', 0, 1, @total, @keep, @remove) WITH NOWAIT
 
 -- WatchProperty (via FK to WatchOperation)
 SELECT @total = COUNT_BIG(*) FROM WatchProperty
@@ -57,13 +57,13 @@ SELECT @keep  = COUNT_BIG(*) FROM WatchProperty child
     INNER JOIN WatchOperation parent ON child.UID_DialogWatchOperation = parent.UID_DialogWatchOperation
     WHERE parent.OperationDate >= @CutoffDate
 SET @remove = @total - @keep
-PRINT 'WatchProperty:    ' + CAST(@total AS VARCHAR) + ' total | ' + CAST(@keep AS VARCHAR) + ' keep | ' + CAST(@remove AS VARCHAR) + ' remove'
+RAISERROR('WatchProperty:    %I64d total | %I64d keep | %I64d remove', 0, 1, @total, @keep, @remove) WITH NOWAIT
 
 -- ProcessInfo
 SELECT @total = COUNT_BIG(*) FROM ProcessInfo
 SELECT @keep  = COUNT_BIG(*) FROM ProcessInfo WHERE FirstDate >= @CutoffDate
 SET @remove = @total - @keep
-PRINT 'ProcessInfo:      ' + CAST(@total AS VARCHAR) + ' total | ' + CAST(@keep AS VARCHAR) + ' keep | ' + CAST(@remove AS VARCHAR) + ' remove'
+RAISERROR('ProcessInfo:      %I64d total | %I64d keep | %I64d remove', 0, 1, @total, @keep, @remove) WITH NOWAIT
 
 -- ProcessSubstitute (via FK to ProcessInfo)
 SELECT @total = COUNT_BIG(*) FROM ProcessSubstitute
@@ -71,43 +71,43 @@ SELECT @keep  = COUNT_BIG(*) FROM ProcessSubstitute child
     INNER JOIN ProcessInfo parent ON child.UID_ProcessInfoNew = parent.UID_ProcessInfo
     WHERE parent.FirstDate >= @CutoffDate
 SET @remove = @total - @keep
-PRINT 'ProcessSubstitute:' + CAST(@total AS VARCHAR) + ' total | ' + CAST(@keep AS VARCHAR) + ' keep | ' + CAST(@remove AS VARCHAR) + ' remove'
+RAISERROR('ProcessSubstitute:%I64d total | %I64d keep | %I64d remove', 0, 1, @total, @keep, @remove) WITH NOWAIT
 
 -- ProcessGroup
 SELECT @total = COUNT_BIG(*) FROM ProcessGroup
 SELECT @keep  = COUNT_BIG(*) FROM ProcessGroup WHERE FirstDate >= @CutoffDate
 SET @remove = @total - @keep
-PRINT 'ProcessGroup:     ' + CAST(@total AS VARCHAR) + ' total | ' + CAST(@keep AS VARCHAR) + ' keep | ' + CAST(@remove AS VARCHAR) + ' remove'
+RAISERROR('ProcessGroup:     %I64d total | %I64d keep | %I64d remove', 0, 1, @total, @keep, @remove) WITH NOWAIT
 
 -- ProcessStep
 SELECT @total = COUNT_BIG(*) FROM ProcessStep
 SELECT @keep  = COUNT_BIG(*) FROM ProcessStep WHERE ThisDate >= @CutoffDate
 SET @remove = @total - @keep
-PRINT 'ProcessStep:      ' + CAST(@total AS VARCHAR) + ' total | ' + CAST(@keep AS VARCHAR) + ' keep | ' + CAST(@remove AS VARCHAR) + ' remove'
+RAISERROR('ProcessStep:      %I64d total | %I64d keep | %I64d remove', 0, 1, @total, @keep, @remove) WITH NOWAIT
 
 -- ProcessChain
 SELECT @total = COUNT_BIG(*) FROM ProcessChain
 SELECT @keep  = COUNT_BIG(*) FROM ProcessChain WHERE ThisDate >= @CutoffDate
 SET @remove = @total - @keep
-PRINT 'ProcessChain:     ' + CAST(@total AS VARCHAR) + ' total | ' + CAST(@keep AS VARCHAR) + ' keep | ' + CAST(@remove AS VARCHAR) + ' remove'
+RAISERROR('ProcessChain:     %I64d total | %I64d keep | %I64d remove', 0, 1, @total, @keep, @remove) WITH NOWAIT
 
 -- HistoryJob
 SELECT @total = COUNT_BIG(*) FROM HistoryJob
 SELECT @keep  = COUNT_BIG(*) FROM HistoryJob WHERE StartAt >= @CutoffDate
 SET @remove = @total - @keep
-PRINT 'HistoryJob:       ' + CAST(@total AS VARCHAR) + ' total | ' + CAST(@keep AS VARCHAR) + ' keep | ' + CAST(@remove AS VARCHAR) + ' remove'
+RAISERROR('HistoryJob:       %I64d total | %I64d keep | %I64d remove', 0, 1, @total, @keep, @remove) WITH NOWAIT
 
 -- HistoryChain
 SELECT @total = COUNT_BIG(*) FROM HistoryChain
 SELECT @keep  = COUNT_BIG(*) FROM HistoryChain WHERE FirstDate >= @CutoffDate
 SET @remove = @total - @keep
-PRINT 'HistoryChain:     ' + CAST(@total AS VARCHAR) + ' total | ' + CAST(@keep AS VARCHAR) + ' keep | ' + CAST(@remove AS VARCHAR) + ' remove'
+RAISERROR('HistoryChain:     %I64d total | %I64d keep | %I64d remove', 0, 1, @total, @keep, @remove) WITH NOWAIT
 
-PRINT ''
+RAISERROR(' ', 0, 1) WITH NOWAIT
 
 IF @WhatIf = 1
 BEGIN
-    PRINT 'WhatIf mode — nothing changed.'
+    RAISERROR('WhatIf mode — nothing changed.', 0, 1) WITH NOWAIT
     RETURN
 END
 
@@ -120,17 +120,17 @@ DECLARE @origRecovery NVARCHAR(60)
 SELECT @origRecovery = recovery_model_desc
 FROM sys.databases WHERE name = DB_NAME()
 
-PRINT 'Recovery model: ' + @origRecovery
+RAISERROR('Recovery model: %s', 0, 1, @origRecovery) WITH NOWAIT
 IF @origRecovery <> 'SIMPLE'
 BEGIN
-    PRINT 'Switching to SIMPLE for minimal logging...'
+    RAISERROR('Switching to SIMPLE for minimal logging...', 0, 1) WITH NOWAIT
     DECLARE @sqlRM NVARCHAR(200) = 'ALTER DATABASE [' + DB_NAME() + '] SET RECOVERY SIMPLE'
     EXEC sp_executesql @sqlRM
 END
 
 -- ── Capture and drop all HDB foreign keys ───────────────────
-PRINT ''
-PRINT '# Dropping foreign keys...'
+RAISERROR(' ', 0, 1) WITH NOWAIT
+RAISERROR('# Dropping foreign keys...', 0, 1) WITH NOWAIT
 
 -- Store FK definitions for later recreation
 IF OBJECT_ID('tempdb..#FKDefinitions') IS NOT NULL DROP TABLE #FKDefinitions
@@ -167,15 +167,15 @@ OPEN fk_cur
 FETCH NEXT FROM fk_cur INTO @fkDrop
 WHILE @@FETCH_STATUS = 0
 BEGIN
-    PRINT '  ' + @fkDrop
+    RAISERROR('  %s', 0, 1, @fkDrop) WITH NOWAIT
     EXEC sp_executesql @fkDrop
     FETCH NEXT FROM fk_cur INTO @fkDrop
 END
 CLOSE fk_cur; DEALLOCATE fk_cur
 
-PRINT ''
-PRINT '# TRUNCATE cleanup'
-PRINT '================================================'
+RAISERROR(' ', 0, 1) WITH NOWAIT
+RAISERROR('# TRUNCATE cleanup', 0, 1) WITH NOWAIT
+RAISERROR('================================================', 0, 1) WITH NOWAIT
 
 DECLARE @st DATETIME
 DECLARE @sec INT
@@ -184,7 +184,7 @@ DECLARE @kept BIGINT
 -- ────────────────────────────────────────────────────────────
 -- 1. WatchProperty  (FK join → WatchOperation.OperationDate)
 -- ────────────────────────────────────────────────────────────
-PRINT 'WatchProperty...'
+RAISERROR('WatchProperty...', 0, 1) WITH NOWAIT
 SET @st = GETDATE()
 
 SELECT child.*
@@ -202,12 +202,12 @@ SET @kept = @@ROWCOUNT
 DROP TABLE #Keep_WatchProperty
 
 SET @sec = DATEDIFF(SECOND, @st, GETDATE())
-PRINT '  Kept ' + CAST(@kept AS VARCHAR) + ' rows | ' + CAST(@sec AS VARCHAR) + 's'
+RAISERROR('  Kept %I64d rows | %ds', 0, 1, @kept, @sec) WITH NOWAIT
 
 -- ────────────────────────────────────────────────────────────
 -- 2. WatchOperation  (OperationDate)
 -- ────────────────────────────────────────────────────────────
-PRINT 'WatchOperation...'
+RAISERROR('WatchOperation...', 0, 1) WITH NOWAIT
 SET @st = GETDATE()
 
 SELECT * INTO #Keep_WatchOperation
@@ -220,12 +220,12 @@ SET @kept = @@ROWCOUNT
 DROP TABLE #Keep_WatchOperation
 
 SET @sec = DATEDIFF(SECOND, @st, GETDATE())
-PRINT '  Kept ' + CAST(@kept AS VARCHAR) + ' rows | ' + CAST(@sec AS VARCHAR) + 's'
+RAISERROR('  Kept %I64d rows | %ds', 0, 1, @kept, @sec) WITH NOWAIT
 
 -- ────────────────────────────────────────────────────────────
 -- 3. ProcessStep  (ThisDate)
 -- ────────────────────────────────────────────────────────────
-PRINT 'ProcessStep...'
+RAISERROR('ProcessStep...', 0, 1) WITH NOWAIT
 SET @st = GETDATE()
 
 SELECT * INTO #Keep_ProcessStep
@@ -238,12 +238,12 @@ SET @kept = @@ROWCOUNT
 DROP TABLE #Keep_ProcessStep
 
 SET @sec = DATEDIFF(SECOND, @st, GETDATE())
-PRINT '  Kept ' + CAST(@kept AS VARCHAR) + ' rows | ' + CAST(@sec AS VARCHAR) + 's'
+RAISERROR('  Kept %I64d rows | %ds', 0, 1, @kept, @sec) WITH NOWAIT
 
 -- ────────────────────────────────────────────────────────────
 -- 4. ProcessSubstitute  (FK join → ProcessInfo.FirstDate)
 -- ────────────────────────────────────────────────────────────
-PRINT 'ProcessSubstitute...'
+RAISERROR('ProcessSubstitute...', 0, 1) WITH NOWAIT
 SET @st = GETDATE()
 
 SELECT child.*
@@ -259,12 +259,12 @@ SET @kept = @@ROWCOUNT
 DROP TABLE #Keep_ProcessSubstitute
 
 SET @sec = DATEDIFF(SECOND, @st, GETDATE())
-PRINT '  Kept ' + CAST(@kept AS VARCHAR) + ' rows | ' + CAST(@sec AS VARCHAR) + 's'
+RAISERROR('  Kept %I64d rows | %ds', 0, 1, @kept, @sec) WITH NOWAIT
 
 -- ────────────────────────────────────────────────────────────
 -- 5. ProcessChain  (ThisDate)
 -- ────────────────────────────────────────────────────────────
-PRINT 'ProcessChain...'
+RAISERROR('ProcessChain...', 0, 1) WITH NOWAIT
 SET @st = GETDATE()
 
 SELECT * INTO #Keep_ProcessChain
@@ -277,12 +277,12 @@ SET @kept = @@ROWCOUNT
 DROP TABLE #Keep_ProcessChain
 
 SET @sec = DATEDIFF(SECOND, @st, GETDATE())
-PRINT '  Kept ' + CAST(@kept AS VARCHAR) + ' rows | ' + CAST(@sec AS VARCHAR) + 's'
+RAISERROR('  Kept %I64d rows | %ds', 0, 1, @kept, @sec) WITH NOWAIT
 
 -- ────────────────────────────────────────────────────────────
 -- 6. HistoryJob  (StartAt)
 -- ────────────────────────────────────────────────────────────
-PRINT 'HistoryJob...'
+RAISERROR('HistoryJob...', 0, 1) WITH NOWAIT
 SET @st = GETDATE()
 
 SELECT * INTO #Keep_HistoryJob
@@ -295,12 +295,12 @@ SET @kept = @@ROWCOUNT
 DROP TABLE #Keep_HistoryJob
 
 SET @sec = DATEDIFF(SECOND, @st, GETDATE())
-PRINT '  Kept ' + CAST(@kept AS VARCHAR) + ' rows | ' + CAST(@sec AS VARCHAR) + 's'
+RAISERROR('  Kept %I64d rows | %ds', 0, 1, @kept, @sec) WITH NOWAIT
 
 -- ────────────────────────────────────────────────────────────
 -- 7. HistoryChain  (FirstDate)
 -- ────────────────────────────────────────────────────────────
-PRINT 'HistoryChain...'
+RAISERROR('HistoryChain...', 0, 1) WITH NOWAIT
 SET @st = GETDATE()
 
 SELECT * INTO #Keep_HistoryChain
@@ -313,12 +313,12 @@ SET @kept = @@ROWCOUNT
 DROP TABLE #Keep_HistoryChain
 
 SET @sec = DATEDIFF(SECOND, @st, GETDATE())
-PRINT '  Kept ' + CAST(@kept AS VARCHAR) + ' rows | ' + CAST(@sec AS VARCHAR) + 's'
+RAISERROR('  Kept %I64d rows | %ds', 0, 1, @kept, @sec) WITH NOWAIT
 
 -- ────────────────────────────────────────────────────────────
 -- 8. ProcessInfo  (FirstDate)
 -- ────────────────────────────────────────────────────────────
-PRINT 'ProcessInfo...'
+RAISERROR('ProcessInfo...', 0, 1) WITH NOWAIT
 SET @st = GETDATE()
 
 SELECT * INTO #Keep_ProcessInfo
@@ -331,12 +331,12 @@ SET @kept = @@ROWCOUNT
 DROP TABLE #Keep_ProcessInfo
 
 SET @sec = DATEDIFF(SECOND, @st, GETDATE())
-PRINT '  Kept ' + CAST(@kept AS VARCHAR) + ' rows | ' + CAST(@sec AS VARCHAR) + 's'
+RAISERROR('  Kept %I64d rows | %ds', 0, 1, @kept, @sec) WITH NOWAIT
 
 -- ────────────────────────────────────────────────────────────
 -- 9. ProcessGroup  (FirstDate)
 -- ────────────────────────────────────────────────────────────
-PRINT 'ProcessGroup...'
+RAISERROR('ProcessGroup...', 0, 1) WITH NOWAIT
 SET @st = GETDATE()
 
 SELECT * INTO #Keep_ProcessGroup
@@ -349,11 +349,11 @@ SET @kept = @@ROWCOUNT
 DROP TABLE #Keep_ProcessGroup
 
 SET @sec = DATEDIFF(SECOND, @st, GETDATE())
-PRINT '  Kept ' + CAST(@kept AS VARCHAR) + ' rows | ' + CAST(@sec AS VARCHAR) + 's'
+RAISERROR('  Kept %I64d rows | %ds', 0, 1, @kept, @sec) WITH NOWAIT
 
 -- ── Recreate foreign keys ───────────────────────────────────
-PRINT ''
-PRINT '# Recreating foreign keys...'
+RAISERROR(' ', 0, 1) WITH NOWAIT
+RAISERROR('# Recreating foreign keys...', 0, 1) WITH NOWAIT
 
 DECLARE @fkCreate NVARCHAR(500)
 DECLARE fk_cur2 CURSOR LOCAL FAST_FORWARD FOR
@@ -365,7 +365,7 @@ OPEN fk_cur2
 FETCH NEXT FROM fk_cur2 INTO @fkCreate
 WHILE @@FETCH_STATUS = 0
 BEGIN
-    PRINT '  ' + @fkCreate
+    RAISERROR('  %s', 0, 1, @fkCreate) WITH NOWAIT
     EXEC sp_executesql @fkCreate
     FETCH NEXT FROM fk_cur2 INTO @fkCreate
 END
@@ -377,14 +377,14 @@ DROP TABLE #FKDefinitions
 IF @origRecovery <> 'SIMPLE'
 BEGIN
     DECLARE @sqlRestore NVARCHAR(200) = 'ALTER DATABASE [' + DB_NAME() + '] SET RECOVERY ' + @origRecovery
-    PRINT ''
-    PRINT 'Restoring recovery model to ' + @origRecovery + '...'
+    RAISERROR(' ', 0, 1) WITH NOWAIT
+    RAISERROR('Restoring recovery model to %s...', 0, 1, @origRecovery) WITH NOWAIT
     EXEC sp_executesql @sqlRestore
 END
 
 -- ════════════════════════════════════════════════════════════
-PRINT ''
-PRINT '================================================'
-PRINT 'Cleanup complete.'
-PRINT '================================================'
+RAISERROR(' ', 0, 1) WITH NOWAIT
+RAISERROR('================================================', 0, 1) WITH NOWAIT
+RAISERROR('Cleanup complete.', 0, 1) WITH NOWAIT
+RAISERROR('================================================', 0, 1) WITH NOWAIT
 GO
