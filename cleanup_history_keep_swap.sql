@@ -190,7 +190,8 @@ DECLARE @reloadRc INT = 0
 
 -- Add identity column for deterministic range-based batching
 ALTER TABLE dbo.Keep_WatchOperation ADD _BatchID INT IDENTITY(1,1)
-DECLARE @maxIdWO INT = (SELECT MAX(_BatchID) FROM dbo.Keep_WatchOperation)
+DECLARE @maxIdWO INT
+EXEC sp_executesql N'SELECT @m = MAX(_BatchID) FROM dbo.Keep_WatchOperation', N'@m INT OUTPUT', @m = @maxIdWO OUTPUT
 DECLARE @loWO INT = 1
 
 IF EXISTS (SELECT 1 FROM sys.identity_columns WHERE object_id = OBJECT_ID('dbo.WatchOperation'))
@@ -228,7 +229,8 @@ SET @st = GETDATE()
 SET @reloadTotal = 0
 
 ALTER TABLE dbo.Keep_WatchProperty ADD _BatchID INT IDENTITY(1,1)
-DECLARE @maxIdWP INT = (SELECT MAX(_BatchID) FROM dbo.Keep_WatchProperty)
+DECLARE @maxIdWP INT
+EXEC sp_executesql N'SELECT @m = MAX(_BatchID) FROM dbo.Keep_WatchProperty', N'@m INT OUTPUT', @m = @maxIdWP OUTPUT
 DECLARE @loWP INT = 1
 
 IF EXISTS (SELECT 1 FROM sys.identity_columns WHERE object_id = OBJECT_ID('dbo.WatchProperty'))
