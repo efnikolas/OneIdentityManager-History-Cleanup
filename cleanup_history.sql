@@ -448,7 +448,7 @@ BEGIN
     SET @Total = 0  SET @Start = GETDATE()  SET @Deleted = 1
     WHILE @Deleted > 0
     BEGIN
-        DELETE TOP (@BatchSize) FROM HistoryJob WHERE StartAt < @CutoffDate OR StartAt IS NULL
+        DELETE TOP (@BatchSize) FROM HistoryJob WHERE StartAt < @CutoffDate
         SET @Deleted = @@ROWCOUNT
         SET @Total = @Total + @Deleted
         IF @Deleted > 0
@@ -519,7 +519,6 @@ BEGIN
     BEGIN
         DELETE TOP (@BatchSize) FROM ProcessGroup
         WHERE COALESCE(FirstDate, LastDate, ExportDate) < @CutoffDate
-              OR (FirstDate IS NULL AND LastDate IS NULL AND ExportDate IS NULL)
         SET @Deleted = @@ROWCOUNT
         SET @Total = @Total + @Deleted
         IF @Deleted > 0
