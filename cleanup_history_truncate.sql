@@ -187,6 +187,7 @@ DECLARE @kept BIGINT
 RAISERROR('WatchProperty...', 0, 1) WITH NOWAIT
 SET @st = GETDATE()
 
+IF OBJECT_ID('tempdb..#Keep_WatchProperty') IS NOT NULL DROP TABLE #Keep_WatchProperty
 SELECT child.*
 INTO #Keep_WatchProperty
 FROM WatchProperty child
@@ -196,7 +197,6 @@ WHERE parent.OperationDate >= @CutoffDate
 
 TRUNCATE TABLE WatchProperty
 
-SET IDENTITY_INSERT WatchProperty OFF  -- no identity cols expected, but safe
 INSERT INTO WatchProperty SELECT * FROM #Keep_WatchProperty
 SET @kept = @@ROWCOUNT
 DROP TABLE #Keep_WatchProperty
@@ -210,6 +210,7 @@ RAISERROR('  Kept %I64d rows | %ds', 0, 1, @kept, @sec) WITH NOWAIT
 RAISERROR('WatchOperation...', 0, 1) WITH NOWAIT
 SET @st = GETDATE()
 
+IF OBJECT_ID('tempdb..#Keep_WatchOperation') IS NOT NULL DROP TABLE #Keep_WatchOperation
 SELECT * INTO #Keep_WatchOperation
 FROM WatchOperation WHERE OperationDate >= @CutoffDate
 
@@ -228,6 +229,7 @@ RAISERROR('  Kept %I64d rows | %ds', 0, 1, @kept, @sec) WITH NOWAIT
 RAISERROR('ProcessStep...', 0, 1) WITH NOWAIT
 SET @st = GETDATE()
 
+IF OBJECT_ID('tempdb..#Keep_ProcessStep') IS NOT NULL DROP TABLE #Keep_ProcessStep
 SELECT * INTO #Keep_ProcessStep
 FROM ProcessStep WHERE ThisDate >= @CutoffDate
 
@@ -246,6 +248,7 @@ RAISERROR('  Kept %I64d rows | %ds', 0, 1, @kept, @sec) WITH NOWAIT
 RAISERROR('ProcessSubstitute...', 0, 1) WITH NOWAIT
 SET @st = GETDATE()
 
+IF OBJECT_ID('tempdb..#Keep_ProcessSubstitute') IS NOT NULL DROP TABLE #Keep_ProcessSubstitute
 SELECT child.*
 INTO #Keep_ProcessSubstitute
 FROM ProcessSubstitute child
@@ -267,6 +270,7 @@ RAISERROR('  Kept %I64d rows | %ds', 0, 1, @kept, @sec) WITH NOWAIT
 RAISERROR('ProcessChain...', 0, 1) WITH NOWAIT
 SET @st = GETDATE()
 
+IF OBJECT_ID('tempdb..#Keep_ProcessChain') IS NOT NULL DROP TABLE #Keep_ProcessChain
 SELECT * INTO #Keep_ProcessChain
 FROM ProcessChain WHERE ThisDate >= @CutoffDate
 
@@ -285,6 +289,7 @@ RAISERROR('  Kept %I64d rows | %ds', 0, 1, @kept, @sec) WITH NOWAIT
 RAISERROR('HistoryJob...', 0, 1) WITH NOWAIT
 SET @st = GETDATE()
 
+IF OBJECT_ID('tempdb..#Keep_HistoryJob') IS NOT NULL DROP TABLE #Keep_HistoryJob
 SELECT * INTO #Keep_HistoryJob
 FROM HistoryJob WHERE StartAt >= @CutoffDate
 
@@ -303,6 +308,7 @@ RAISERROR('  Kept %I64d rows | %ds', 0, 1, @kept, @sec) WITH NOWAIT
 RAISERROR('HistoryChain...', 0, 1) WITH NOWAIT
 SET @st = GETDATE()
 
+IF OBJECT_ID('tempdb..#Keep_HistoryChain') IS NOT NULL DROP TABLE #Keep_HistoryChain
 SELECT * INTO #Keep_HistoryChain
 FROM HistoryChain WHERE FirstDate >= @CutoffDate
 
@@ -321,6 +327,7 @@ RAISERROR('  Kept %I64d rows | %ds', 0, 1, @kept, @sec) WITH NOWAIT
 RAISERROR('ProcessInfo...', 0, 1) WITH NOWAIT
 SET @st = GETDATE()
 
+IF OBJECT_ID('tempdb..#Keep_ProcessInfo') IS NOT NULL DROP TABLE #Keep_ProcessInfo
 SELECT * INTO #Keep_ProcessInfo
 FROM ProcessInfo WHERE FirstDate >= @CutoffDate
 
@@ -339,6 +346,7 @@ RAISERROR('  Kept %I64d rows | %ds', 0, 1, @kept, @sec) WITH NOWAIT
 RAISERROR('ProcessGroup...', 0, 1) WITH NOWAIT
 SET @st = GETDATE()
 
+IF OBJECT_ID('tempdb..#Keep_ProcessGroup') IS NOT NULL DROP TABLE #Keep_ProcessGroup
 SELECT * INTO #Keep_ProcessGroup
 FROM ProcessGroup WHERE FirstDate >= @CutoffDate
 
