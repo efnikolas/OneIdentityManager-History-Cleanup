@@ -144,11 +144,11 @@ BEGIN
             CHECKPOINT
             SET @Sec = DATEDIFF(SECOND, @Start, GETDATE())
             SET @Rate = CASE WHEN @Sec > 0 THEN @Total / @Sec ELSE 0 END
-            PRINT '  batch ' + CAST(@Deleted AS VARCHAR) + ' | total ' + CAST(@Total AS VARCHAR) + ' | ' + CAST(@Sec AS VARCHAR) + 's | ~' + CAST(@Rate AS VARCHAR) + ' rows/sec'
+            RAISERROR('  batch %d | total %I64d | %ds | ~%I64d rows/sec', 0, 1, @Deleted, @Total, @Sec, @Rate) WITH NOWAIT
             IF @BatchDelay <> '00:00:00' WAITFOR DELAY @BatchDelay
         END
     END
-    PRINT '  Done: ' + CAST(@Total AS VARCHAR) + ' rows removed.'
+    RAISERROR('  Done: %I64d rows removed.', 0, 1, @Total) WITH NOWAIT
 END
 PRINT ''
 
@@ -167,11 +167,11 @@ BEGIN
             CHECKPOINT
             SET @Sec = DATEDIFF(SECOND, @Start, GETDATE())
             SET @Rate = CASE WHEN @Sec > 0 THEN @Total / @Sec ELSE 0 END
-            PRINT '  batch ' + CAST(@Deleted AS VARCHAR) + ' | total ' + CAST(@Total AS VARCHAR) + ' | ' + CAST(@Sec AS VARCHAR) + 's | ~' + CAST(@Rate AS VARCHAR) + ' rows/sec'
+            RAISERROR('  batch %d | total %I64d | %ds | ~%I64d rows/sec', 0, 1, @Deleted, @Total, @Sec, @Rate) WITH NOWAIT
             IF @BatchDelay <> '00:00:00' WAITFOR DELAY @BatchDelay
         END
     END
-    PRINT '  Done: ' + CAST(@Total AS VARCHAR) + ' rows removed.'
+    RAISERROR('  Done: %I64d rows removed.', 0, 1, @Total) WITH NOWAIT
 END
 PRINT ''
 
@@ -190,11 +190,11 @@ BEGIN
             CHECKPOINT
             SET @Sec = DATEDIFF(SECOND, @Start, GETDATE())
             SET @Rate = CASE WHEN @Sec > 0 THEN @Total / @Sec ELSE 0 END
-            PRINT '  batch ' + CAST(@Deleted AS VARCHAR) + ' | total ' + CAST(@Total AS VARCHAR) + ' | ' + CAST(@Sec AS VARCHAR) + 's | ~' + CAST(@Rate AS VARCHAR) + ' rows/sec'
+            RAISERROR('  batch %d | total %I64d | %ds | ~%I64d rows/sec', 0, 1, @Deleted, @Total, @Sec, @Rate) WITH NOWAIT
             IF @BatchDelay <> '00:00:00' WAITFOR DELAY @BatchDelay
         END
     END
-    PRINT '  Done: ' + CAST(@Total AS VARCHAR) + ' rows removed.'
+    RAISERROR('  Done: %I64d rows removed.', 0, 1, @Total) WITH NOWAIT
 END
 PRINT ''
 
@@ -217,11 +217,11 @@ BEGIN
             CHECKPOINT
             SET @Sec = DATEDIFF(SECOND, @Start, GETDATE())
             SET @Rate = CASE WHEN @Sec > 0 THEN @Total / @Sec ELSE 0 END
-            PRINT '  batch ' + CAST(@Deleted AS VARCHAR) + ' | total ' + CAST(@Total AS VARCHAR) + ' | ' + CAST(@Sec AS VARCHAR) + 's | ~' + CAST(@Rate AS VARCHAR) + ' rows/sec'
+            RAISERROR('  batch %d | total %I64d | %ds | ~%I64d rows/sec', 0, 1, @Deleted, @Total, @Sec, @Rate) WITH NOWAIT
             IF @BatchDelay <> '00:00:00' WAITFOR DELAY @BatchDelay
         END
     END
-    PRINT '  Done: ' + CAST(@Total AS VARCHAR) + ' rows removed.'
+    RAISERROR('  Done: %I64d rows removed.', 0, 1, @Total) WITH NOWAIT
 END
 PRINT ''
 
@@ -240,11 +240,11 @@ BEGIN
             CHECKPOINT
             SET @Sec = DATEDIFF(SECOND, @Start, GETDATE())
             SET @Rate = CASE WHEN @Sec > 0 THEN @Total / @Sec ELSE 0 END
-            PRINT '  batch ' + CAST(@Deleted AS VARCHAR) + ' | total ' + CAST(@Total AS VARCHAR) + ' | ' + CAST(@Sec AS VARCHAR) + 's | ~' + CAST(@Rate AS VARCHAR) + ' rows/sec'
+            RAISERROR('  batch %d | total %I64d | %ds | ~%I64d rows/sec', 0, 1, @Deleted, @Total, @Sec, @Rate) WITH NOWAIT
             IF @BatchDelay <> '00:00:00' WAITFOR DELAY @BatchDelay
         END
     END
-    PRINT '  Done: ' + CAST(@Total AS VARCHAR) + ' rows removed.'
+    RAISERROR('  Done: %I64d rows removed.', 0, 1, @Total) WITH NOWAIT
 END
 PRINT ''
 
@@ -263,11 +263,11 @@ BEGIN
             CHECKPOINT
             SET @Sec = DATEDIFF(SECOND, @Start, GETDATE())
             SET @Rate = CASE WHEN @Sec > 0 THEN @Total / @Sec ELSE 0 END
-            PRINT '  batch ' + CAST(@Deleted AS VARCHAR) + ' | total ' + CAST(@Total AS VARCHAR) + ' | ' + CAST(@Sec AS VARCHAR) + 's | ~' + CAST(@Rate AS VARCHAR) + ' rows/sec'
+            RAISERROR('  batch %d | total %I64d | %ds | ~%I64d rows/sec', 0, 1, @Deleted, @Total, @Sec, @Rate) WITH NOWAIT
             IF @BatchDelay <> '00:00:00' WAITFOR DELAY @BatchDelay
         END
     END
-    PRINT '  Done: ' + CAST(@Total AS VARCHAR) + ' rows removed.'
+    RAISERROR('  Done: %I64d rows removed.', 0, 1, @Total) WITH NOWAIT
 END
 PRINT ''
 
@@ -286,11 +286,11 @@ BEGIN
             CHECKPOINT
             SET @Sec = DATEDIFF(SECOND, @Start, GETDATE())
             SET @Rate = CASE WHEN @Sec > 0 THEN @Total / @Sec ELSE 0 END
-            PRINT '  batch ' + CAST(@Deleted AS VARCHAR) + ' | total ' + CAST(@Total AS VARCHAR) + ' | ' + CAST(@Sec AS VARCHAR) + 's | ~' + CAST(@Rate AS VARCHAR) + ' rows/sec'
+            RAISERROR('  batch %d | total %I64d | %ds | ~%I64d rows/sec', 0, 1, @Deleted, @Total, @Sec, @Rate) WITH NOWAIT
             IF @BatchDelay <> '00:00:00' WAITFOR DELAY @BatchDelay
         END
     END
-    PRINT '  Done: ' + CAST(@Total AS VARCHAR) + ' rows removed.'
+    RAISERROR('  Done: %I64d rows removed.', 0, 1, @Total) WITH NOWAIT
 END
 PRINT ''
 
@@ -309,11 +309,11 @@ BEGIN
             CHECKPOINT
             SET @Sec = DATEDIFF(SECOND, @Start, GETDATE())
             SET @Rate = CASE WHEN @Sec > 0 THEN @Total / @Sec ELSE 0 END
-            PRINT '  batch ' + CAST(@Deleted AS VARCHAR) + ' | total ' + CAST(@Total AS VARCHAR) + ' | ' + CAST(@Sec AS VARCHAR) + 's | ~' + CAST(@Rate AS VARCHAR) + ' rows/sec'
+            RAISERROR('  batch %d | total %I64d | %ds | ~%I64d rows/sec', 0, 1, @Deleted, @Total, @Sec, @Rate) WITH NOWAIT
             IF @BatchDelay <> '00:00:00' WAITFOR DELAY @BatchDelay
         END
     END
-    PRINT '  Done: ' + CAST(@Total AS VARCHAR) + ' rows removed.'
+    RAISERROR('  Done: %I64d rows removed.', 0, 1, @Total) WITH NOWAIT
 END
 PRINT ''
 
@@ -337,11 +337,11 @@ BEGIN
             CHECKPOINT
             SET @Sec = DATEDIFF(SECOND, @Start, GETDATE())
             SET @Rate = CASE WHEN @Sec > 0 THEN @Total / @Sec ELSE 0 END
-            PRINT '  batch ' + CAST(@Deleted AS VARCHAR) + ' | total ' + CAST(@Total AS VARCHAR) + ' | ' + CAST(@Sec AS VARCHAR) + 's | ~' + CAST(@Rate AS VARCHAR) + ' rows/sec'
+            RAISERROR('  batch %d | total %I64d | %ds | ~%I64d rows/sec', 0, 1, @Deleted, @Total, @Sec, @Rate) WITH NOWAIT
             IF @BatchDelay <> '00:00:00' WAITFOR DELAY @BatchDelay
         END
     END
-    PRINT '  Done: ' + CAST(@Total AS VARCHAR) + ' rows removed.'
+    RAISERROR('  Done: %I64d rows removed.', 0, 1, @Total) WITH NOWAIT
 END
 PRINT ''
 
@@ -360,11 +360,11 @@ BEGIN
             CHECKPOINT
             SET @Sec = DATEDIFF(SECOND, @Start, GETDATE())
             SET @Rate = CASE WHEN @Sec > 0 THEN @Total / @Sec ELSE 0 END
-            PRINT '  batch ' + CAST(@Deleted AS VARCHAR) + ' | total ' + CAST(@Total AS VARCHAR) + ' | ' + CAST(@Sec AS VARCHAR) + 's | ~' + CAST(@Rate AS VARCHAR) + ' rows/sec'
+            RAISERROR('  batch %d | total %I64d | %ds | ~%I64d rows/sec', 0, 1, @Deleted, @Total, @Sec, @Rate) WITH NOWAIT
             IF @BatchDelay <> '00:00:00' WAITFOR DELAY @BatchDelay
         END
     END
-    PRINT '  Done: ' + CAST(@Total AS VARCHAR) + ' rows removed.'
+    RAISERROR('  Done: %I64d rows removed.', 0, 1, @Total) WITH NOWAIT
 END
 PRINT ''
 
@@ -383,11 +383,11 @@ BEGIN
             CHECKPOINT
             SET @Sec = DATEDIFF(SECOND, @Start, GETDATE())
             SET @Rate = CASE WHEN @Sec > 0 THEN @Total / @Sec ELSE 0 END
-            PRINT '  batch ' + CAST(@Deleted AS VARCHAR) + ' | total ' + CAST(@Total AS VARCHAR) + ' | ' + CAST(@Sec AS VARCHAR) + 's | ~' + CAST(@Rate AS VARCHAR) + ' rows/sec'
+            RAISERROR('  batch %d | total %I64d | %ds | ~%I64d rows/sec', 0, 1, @Deleted, @Total, @Sec, @Rate) WITH NOWAIT
             IF @BatchDelay <> '00:00:00' WAITFOR DELAY @BatchDelay
         END
     END
-    PRINT '  Done: ' + CAST(@Total AS VARCHAR) + ' rows removed.'
+    RAISERROR('  Done: %I64d rows removed.', 0, 1, @Total) WITH NOWAIT
 END
 PRINT ''
 
@@ -410,11 +410,11 @@ BEGIN
             CHECKPOINT
             SET @Sec = DATEDIFF(SECOND, @Start, GETDATE())
             SET @Rate = CASE WHEN @Sec > 0 THEN @Total / @Sec ELSE 0 END
-            PRINT '  batch ' + CAST(@Deleted AS VARCHAR) + ' | total ' + CAST(@Total AS VARCHAR) + ' | ' + CAST(@Sec AS VARCHAR) + 's | ~' + CAST(@Rate AS VARCHAR) + ' rows/sec'
+            RAISERROR('  batch %d | total %I64d | %ds | ~%I64d rows/sec', 0, 1, @Deleted, @Total, @Sec, @Rate) WITH NOWAIT
             IF @BatchDelay <> '00:00:00' WAITFOR DELAY @BatchDelay
         END
     END
-    PRINT '  Done: ' + CAST(@Total AS VARCHAR) + ' rows removed.'
+    RAISERROR('  Done: %I64d rows removed.', 0, 1, @Total) WITH NOWAIT
 END
 PRINT ''
 
@@ -433,11 +433,11 @@ BEGIN
             CHECKPOINT
             SET @Sec = DATEDIFF(SECOND, @Start, GETDATE())
             SET @Rate = CASE WHEN @Sec > 0 THEN @Total / @Sec ELSE 0 END
-            PRINT '  batch ' + CAST(@Deleted AS VARCHAR) + ' | total ' + CAST(@Total AS VARCHAR) + ' | ' + CAST(@Sec AS VARCHAR) + 's | ~' + CAST(@Rate AS VARCHAR) + ' rows/sec'
+            RAISERROR('  batch %d | total %I64d | %ds | ~%I64d rows/sec', 0, 1, @Deleted, @Total, @Sec, @Rate) WITH NOWAIT
             IF @BatchDelay <> '00:00:00' WAITFOR DELAY @BatchDelay
         END
     END
-    PRINT '  Done: ' + CAST(@Total AS VARCHAR) + ' rows removed.'
+    RAISERROR('  Done: %I64d rows removed.', 0, 1, @Total) WITH NOWAIT
 END
 PRINT ''
 
@@ -456,11 +456,11 @@ BEGIN
             CHECKPOINT
             SET @Sec = DATEDIFF(SECOND, @Start, GETDATE())
             SET @Rate = CASE WHEN @Sec > 0 THEN @Total / @Sec ELSE 0 END
-            PRINT '  batch ' + CAST(@Deleted AS VARCHAR) + ' | total ' + CAST(@Total AS VARCHAR) + ' | ' + CAST(@Sec AS VARCHAR) + 's | ~' + CAST(@Rate AS VARCHAR) + ' rows/sec'
+            RAISERROR('  batch %d | total %I64d | %ds | ~%I64d rows/sec', 0, 1, @Deleted, @Total, @Sec, @Rate) WITH NOWAIT
             IF @BatchDelay <> '00:00:00' WAITFOR DELAY @BatchDelay
         END
     END
-    PRINT '  Done: ' + CAST(@Total AS VARCHAR) + ' rows removed.'
+    RAISERROR('  Done: %I64d rows removed.', 0, 1, @Total) WITH NOWAIT
 END
 PRINT ''
 
@@ -479,11 +479,11 @@ BEGIN
             CHECKPOINT
             SET @Sec = DATEDIFF(SECOND, @Start, GETDATE())
             SET @Rate = CASE WHEN @Sec > 0 THEN @Total / @Sec ELSE 0 END
-            PRINT '  batch ' + CAST(@Deleted AS VARCHAR) + ' | total ' + CAST(@Total AS VARCHAR) + ' | ' + CAST(@Sec AS VARCHAR) + 's | ~' + CAST(@Rate AS VARCHAR) + ' rows/sec'
+            RAISERROR('  batch %d | total %I64d | %ds | ~%I64d rows/sec', 0, 1, @Deleted, @Total, @Sec, @Rate) WITH NOWAIT
             IF @BatchDelay <> '00:00:00' WAITFOR DELAY @BatchDelay
         END
     END
-    PRINT '  Done: ' + CAST(@Total AS VARCHAR) + ' rows removed.'
+    RAISERROR('  Done: %I64d rows removed.', 0, 1, @Total) WITH NOWAIT
 END
 PRINT ''
 
@@ -502,11 +502,11 @@ BEGIN
             CHECKPOINT
             SET @Sec = DATEDIFF(SECOND, @Start, GETDATE())
             SET @Rate = CASE WHEN @Sec > 0 THEN @Total / @Sec ELSE 0 END
-            PRINT '  batch ' + CAST(@Deleted AS VARCHAR) + ' | total ' + CAST(@Total AS VARCHAR) + ' | ' + CAST(@Sec AS VARCHAR) + 's | ~' + CAST(@Rate AS VARCHAR) + ' rows/sec'
+            RAISERROR('  batch %d | total %I64d | %ds | ~%I64d rows/sec', 0, 1, @Deleted, @Total, @Sec, @Rate) WITH NOWAIT
             IF @BatchDelay <> '00:00:00' WAITFOR DELAY @BatchDelay
         END
     END
-    PRINT '  Done: ' + CAST(@Total AS VARCHAR) + ' rows removed.'
+    RAISERROR('  Done: %I64d rows removed.', 0, 1, @Total) WITH NOWAIT
 END
 PRINT ''
 
@@ -525,11 +525,11 @@ BEGIN
             CHECKPOINT
             SET @Sec = DATEDIFF(SECOND, @Start, GETDATE())
             SET @Rate = CASE WHEN @Sec > 0 THEN @Total / @Sec ELSE 0 END
-            PRINT '  batch ' + CAST(@Deleted AS VARCHAR) + ' | total ' + CAST(@Total AS VARCHAR) + ' | ' + CAST(@Sec AS VARCHAR) + 's | ~' + CAST(@Rate AS VARCHAR) + ' rows/sec'
+            RAISERROR('  batch %d | total %I64d | %ds | ~%I64d rows/sec', 0, 1, @Deleted, @Total, @Sec, @Rate) WITH NOWAIT
             IF @BatchDelay <> '00:00:00' WAITFOR DELAY @BatchDelay
         END
     END
-    PRINT '  Done: ' + CAST(@Total AS VARCHAR) + ' rows removed.'
+    RAISERROR('  Done: %I64d rows removed.', 0, 1, @Total) WITH NOWAIT
 END
 
 -- ============================================================
