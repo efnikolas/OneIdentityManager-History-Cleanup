@@ -118,10 +118,10 @@ PRINT '================================================'
 --  11. ProcessStep          (ThisDate)
 --  12. ProcessSubstitute    (FK join -> ProcessInfo)
 --  13. ProcessChain         (ThisDate)
---  14. HistoryJob           (COALESCE(StartAt, ReadyAt))
+--  14. HistoryJob           (StartAt)
 --  15. HistoryChain         (COALESCE(FirstDate, LastDate))
 --  16. ProcessInfo          (COALESCE(FirstDate, LastDate))
---  17. ProcessGroup         (COALESCE(FirstDate, LastDate))
+--  17. ProcessGroup         (COALESCE(FirstDate, LastDate, ExportDate))
 -- ============================================================
 
 -- 1. RawWatchProperty (FK join -> RawWatchOperation.OperationDate)
@@ -510,14 +510,16 @@ BEGIN
 END
 PRINT ''
 
--- 17. ProcessGroup (COALESCE(FirstDate, LastDate))
+-- 17. ProcessGroup (COALESCE(FirstDate, LastDate, ExportDate))
 IF OBJECT_ID('ProcessGroup','U') IS NOT NULL
 BEGIN
     PRINT 'Cleaning ProcessGroup...'
     SET @Total = 0  SET @Start = GETDATE()  SET @Deleted = 1
     WHILE @Deleted > 0
     BEGIN
-        DELETE TOP (@BatchSize) FROM ProcessGroup WHERE COALESCE(FirstDate, LastDate) < @CutoffDate
+        DELETE TOP (@BatchSize) FROM ProcessGroup
+        WHERE COALESCE(FirstDate, LastDate, ExportDate) < @CutoffDate
+              OR (FirstDate IS NULL AND LastDate IS NULL AND ExportDate IS NULL)
         SET @Deleted = @@ROWCOUNT
         SET @Total = @Total + @Deleted
         IF @Deleted > 0

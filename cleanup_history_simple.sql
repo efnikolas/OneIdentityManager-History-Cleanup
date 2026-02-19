@@ -313,8 +313,8 @@ BEGIN
 END
 
 -- ────────────────────────────────────────────────────────────
--- 9. ProcessGroup  (COALESCE(FirstDate, LastDate))
---    FirstDate is often NULL; LastDate is reliably populated
+-- 9. ProcessGroup  (COALESCE(FirstDate, LastDate, ExportDate))
+--    FirstDate/LastDate are often NULL; ExportDate is reliably populated
 -- ────────────────────────────────────────────────────────────
 IF OBJECT_ID('ProcessGroup', 'U') IS NOT NULL
 BEGIN
@@ -323,8 +323,8 @@ BEGIN
     WHILE @d > 0
     BEGIN
         DELETE TOP (@BatchSize) FROM ProcessGroup
-        WHERE COALESCE(FirstDate, LastDate) < @CutoffDate
-              OR (FirstDate IS NULL AND LastDate IS NULL)
+        WHERE COALESCE(FirstDate, LastDate, ExportDate) < @CutoffDate
+              OR (FirstDate IS NULL AND LastDate IS NULL AND ExportDate IS NULL)
         SET @d = @@ROWCOUNT; SET @tot += @d
         IF @d > 0 BEGIN CHECKPOINT; SET @sec = DATEDIFF(SECOND, @st, GETDATE()); SET @rate = CASE WHEN @sec > 0 THEN @tot / @sec ELSE 0 END
             RAISERROR('  %I64d deleted | %ds | ~%I64d rows/sec', 0, 1, @tot, @sec, @rate) WITH NOWAIT

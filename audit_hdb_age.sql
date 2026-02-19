@@ -89,12 +89,15 @@ BEGIN
             WHEN 'ThisDate'       THEN 4
             WHEN 'StartAt'        THEN 5
             WHEN 'ExportDate'     THEN 6
-            WHEN 'XDateUpdated'   THEN 7
+            WHEN 'ImportDate'     THEN 7
+            WHEN 'XDateUpdated'   THEN 8
             ELSE 10
         END,
         c.column_id
 
-    -- Find fallback date column (LastDate or EndAt)
+    -- Find fallback date columns (LastDate, then ExportDate)
+    DECLARE @FallbackCol2 NVARCHAR(256) = NULL
+
     SELECT TOP 1 @FallbackCol = c.name
     FROM sys.columns c
     INNER JOIN sys.types ty ON c.user_type_id = ty.user_type_id
@@ -103,11 +106,25 @@ BEGIN
       AND c.name IN ('LastDate', 'EndAt')
     ORDER BY CASE c.name WHEN 'LastDate' THEN 1 WHEN 'EndAt' THEN 2 ELSE 3 END
 
+    -- Find second fallback (ExportDate) for tables where FirstDate AND LastDate can both be NULL
+    IF EXISTS (
+        SELECT 1 FROM sys.columns c
+        INNER JOIN sys.types ty ON c.user_type_id = ty.user_type_id
+        WHERE c.object_id = OBJECT_ID(@TableName)
+          AND c.name = 'ExportDate'
+          AND ty.name IN ('datetime', 'datetime2', 'smalldatetime', 'date')
+    )
+        SET @FallbackCol2 = 'ExportDate'
+
     IF @DateCol IS NOT NULL
     BEGIN
         DECLARE @DateExpr NVARCHAR(512)
-        IF @FallbackCol IS NOT NULL AND @FallbackCol <> @DateCol
+        IF @FallbackCol IS NOT NULL AND @FallbackCol2 IS NOT NULL AND @FallbackCol <> @DateCol
+            SET @DateExpr = N'COALESCE([' + @DateCol + N'], [' + @FallbackCol + N'], [' + @FallbackCol2 + N'])'
+        ELSE IF @FallbackCol IS NOT NULL AND @FallbackCol <> @DateCol
             SET @DateExpr = N'COALESCE([' + @DateCol + N'], [' + @FallbackCol + N'])'
+        ELSE IF @FallbackCol2 IS NOT NULL AND @FallbackCol2 <> @DateCol
+            SET @DateExpr = N'COALESCE([' + @DateCol + N'], [' + @FallbackCol2 + N'])'
         ELSE
             SET @DateExpr = N'[' + @DateCol + N']'
 
@@ -176,23 +193,47 @@ OPEN yr_cur
 FETCH NEXT FROM yr_cur INTO @TableName, @DateCol
 WHILE @@FETCH_STATUS = 0
 BEGIN
+    -- Rebuild COALESCE expression for this table
+    DECLARE @YrExpr NVARCHAR(512)
+    DECLARE @Fb1 NVARCHAR(256) = NULL, @Fb2 NVARCHAR(256) = NULL
+
+    SELECT TOP 1 @Fb1 = c.name
+    FROM sys.columns c INNER JOIN sys.types ty ON c.user_type_id = ty.user_type_id
+    WHERE c.object_id = OBJECT_ID(@TableName) AND c.name IN ('LastDate','EndAt')
+      AND ty.name IN ('datetime','datetime2','smalldatetime','date')
+    ORDER BY CASE c.name WHEN 'LastDate' THEN 1 ELSE 2 END
+
+    IF EXISTS (SELECT 1 FROM sys.columns c INNER JOIN sys.types ty ON c.user_type_id = ty.user_type_id
+              WHERE c.object_id = OBJECT_ID(@TableName) AND c.name = 'ExportDate'
+                AND ty.name IN ('datetime','datetime2','smalldatetime','date'))
+        SET @Fb2 = 'ExportDate'
+
+    IF @Fb1 IS NOT NULL AND @Fb2 IS NOT NULL AND @Fb1 <> @DateCol
+        SET @YrExpr = N'COALESCE([' + @DateCol + N'],[' + @Fb1 + N'],[' + @Fb2 + N'])'
+    ELSE IF @Fb1 IS NOT NULL AND @Fb1 <> @DateCol
+        SET @YrExpr = N'COALESCE([' + @DateCol + N'],[' + @Fb1 + N'])'
+    ELSE IF @Fb2 IS NOT NULL AND @Fb2 <> @DateCol
+        SET @YrExpr = N'COALESCE([' + @DateCol + N'],[' + @Fb2 + N'])'
+    ELSE
+        SET @YrExpr = N'[' + @DateCol + N']'
+
     PRINT '>> ' + @TableName + ' (by ' + @DateCol + '):'
 
     SET @SQL = N'
         SELECT
-            YEAR([' + @DateCol + N'])  AS [Year],
+            YEAR(' + @YrExpr + N')  AS [Year],
             COUNT(*)                   AS [RowCount],
-            MIN([' + @DateCol + N'])   AS EarliestInYear,
-            MAX([' + @DateCol + N'])   AS LatestInYear,
-            CASE WHEN YEAR([' + @DateCol + N']) < YEAR(@cutoff)
+            MIN(' + @YrExpr + N')   AS EarliestInYear,
+            MAX(' + @YrExpr + N')   AS LatestInYear,
+            CASE WHEN YEAR(' + @YrExpr + N') < YEAR(@cutoff)
                  THEN ''PURGE''
-                 WHEN YEAR([' + @DateCol + N']) = YEAR(@cutoff)
+                 WHEN YEAR(' + @YrExpr + N') = YEAR(@cutoff)
                  THEN ''PARTIAL''
                  ELSE ''KEEP''
             END AS [Action]
         FROM [' + @TableName + N']
-        GROUP BY YEAR([' + @DateCol + N'])
-        ORDER BY YEAR([' + @DateCol + N'])'
+        GROUP BY YEAR(' + @YrExpr + N')
+        ORDER BY YEAR(' + @YrExpr + N')'
 
     EXEC sp_executesql @SQL, N'@cutoff DATETIME', @CutoffDate
 
@@ -218,7 +259,25 @@ WHILE @@FETCH_STATUS = 0
 BEGIN
     PRINT '>> ' + @TableName + ' — oldest 5:'
 
-    SET @SQL = N'SELECT TOP 5 * FROM [' + @TableName + N'] ORDER BY [' + @DateCol + N'] ASC'
+    -- Use COALESCE for ordering so NULL-date rows sort correctly
+    DECLARE @OrdExpr NVARCHAR(512)
+    DECLARE @Of1 NVARCHAR(256) = NULL, @Of2 NVARCHAR(256) = NULL
+    SELECT TOP 1 @Of1 = c.name FROM sys.columns c INNER JOIN sys.types ty ON c.user_type_id = ty.user_type_id
+    WHERE c.object_id = OBJECT_ID(@TableName) AND c.name IN ('LastDate','EndAt') AND ty.name IN ('datetime','datetime2','smalldatetime','date')
+    ORDER BY CASE c.name WHEN 'LastDate' THEN 1 ELSE 2 END
+    IF EXISTS (SELECT 1 FROM sys.columns c INNER JOIN sys.types ty ON c.user_type_id = ty.user_type_id
+              WHERE c.object_id = OBJECT_ID(@TableName) AND c.name = 'ExportDate' AND ty.name IN ('datetime','datetime2','smalldatetime','date'))
+        SET @Of2 = 'ExportDate'
+    IF @Of1 IS NOT NULL AND @Of2 IS NOT NULL AND @Of1 <> @DateCol
+        SET @OrdExpr = N'COALESCE([' + @DateCol + N'],[' + @Of1 + N'],[' + @Of2 + N'])'
+    ELSE IF @Of1 IS NOT NULL AND @Of1 <> @DateCol
+        SET @OrdExpr = N'COALESCE([' + @DateCol + N'],[' + @Of1 + N'])'
+    ELSE IF @Of2 IS NOT NULL AND @Of2 <> @DateCol
+        SET @OrdExpr = N'COALESCE([' + @DateCol + N'],[' + @Of2 + N'])'
+    ELSE
+        SET @OrdExpr = N'[' + @DateCol + N']'
+
+    SET @SQL = N'SELECT TOP 5 * FROM [' + @TableName + N'] ORDER BY ' + @OrdExpr + N' ASC'
     EXEC sp_executesql @SQL
 
     FETCH NEXT FROM old_cur INTO @TableName, @DateCol
