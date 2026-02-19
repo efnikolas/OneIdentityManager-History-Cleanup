@@ -16,8 +16,35 @@ DECLARE @Cut DATETIME = DATEADD(YEAR, -2, GETDATE())
 DECLARE @B   INT      = 500000
 DECLARE @d   INT, @t  BIGINT, @s DATETIME, @sec INT
 
+DECLARE @scriptStart DATETIME = GETDATE()
+
 PRINT 'Cutoff: ' + CONVERT(VARCHAR, @Cut, 120)
 PRINT ''
+
+-- ── Pre-flight: estimated row counts ──────────────────────
+PRINT '# PRE-FLIGHT (estimated rows per table)'
+PRINT '------------------------------------------------'
+DECLARE @tbl NVARCHAR(128), @est BIGINT
+DECLARE @tables TABLE (name NVARCHAR(128))
+INSERT @tables VALUES
+  ('WatchProperty'),('WatchOperation'),('ProcessStep'),
+  ('ProcessSubstitute'),('ProcessChain'),('HistoryJob'),
+  ('HistoryChain'),('ProcessInfo'),('ProcessGroup')
+
+DECLARE pf CURSOR LOCAL FAST_FORWARD FOR SELECT name FROM @tables
+OPEN pf
+FETCH NEXT FROM pf INTO @tbl
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    SELECT @est = SUM(row_count) FROM sys.dm_db_partition_stats
+    WHERE object_id = OBJECT_ID(@tbl) AND index_id IN (0,1)
+    RAISERROR('  %s: ~%I64d rows', 0, 1, @tbl, @est) WITH NOWAIT
+    FETCH NEXT FROM pf INTO @tbl
+END
+CLOSE pf; DEALLOCATE pf
+PRINT ''
+PRINT '# CLEANUP'
+PRINT '================================================'
 
 -- 1. WatchProperty (FK child — must go first)
 PRINT 'WatchProperty...'
@@ -133,6 +160,32 @@ END
 SET @sec = DATEDIFF(SECOND, @s, GETDATE())
 RAISERROR('  Total: %I64d (%ds)', 0, 1, @t, @sec) WITH NOWAIT
 
+-- ── Post-flight: remaining row counts ─────────────────────
 PRINT ''
+PRINT '# POST-FLIGHT (estimated rows remaining)'
+PRINT '------------------------------------------------'
+DECLARE @tbl2 NVARCHAR(128), @est2 BIGINT
+DECLARE @tables2 TABLE (name NVARCHAR(128))
+INSERT @tables2 VALUES
+  ('WatchProperty'),('WatchOperation'),('ProcessStep'),
+  ('ProcessSubstitute'),('ProcessChain'),('HistoryJob'),
+  ('HistoryChain'),('ProcessInfo'),('ProcessGroup')
+
+DECLARE pf2 CURSOR LOCAL FAST_FORWARD FOR SELECT name FROM @tables2
+OPEN pf2
+FETCH NEXT FROM pf2 INTO @tbl2
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    SELECT @est2 = SUM(row_count) FROM sys.dm_db_partition_stats
+    WHERE object_id = OBJECT_ID(@tbl2) AND index_id IN (0,1)
+    RAISERROR('  %s: ~%I64d rows', 0, 1, @tbl2, @est2) WITH NOWAIT
+    FETCH NEXT FROM pf2 INTO @tbl2
+END
+CLOSE pf2; DEALLOCATE pf2
+
+DECLARE @totalSec INT = DATEDIFF(SECOND, @scriptStart, GETDATE())
+PRINT ''
+RAISERROR('Total runtime: %d seconds (~%d minutes)', 0, 1, @totalSec, @totalSec / 60) WITH NOWAIT
+PRINT '================================================'
 PRINT 'Done.'
 GO
