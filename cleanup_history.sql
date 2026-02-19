@@ -1,34 +1,25 @@
 -- ============================================================
--- One Identity Manager — History Database (HDB) Cleanup
+-- One Identity Manager -- History Database (HDB) Cleanup
 -- ============================================================
--- Purges archived data older than 2 years from the OIM
--- History Database (TimeTrace database).
+-- Purges archived data older than @CutoffDate from the OIM
+-- History Database (TimeTrace).
 --
--- The HDB contains archived process monitoring, change
--- tracking, and job history data — NOT application tables
--- like DialogHistory or PersonWantsOrg (those are in the
--- live application database).
+-- Tables (from OIM 9.3 Data Archiving Administration Guide):
+--   Raw:        RawJobHistory, RawProcess, RawProcessChain,
+--               RawProcessGroup, RawProcessStep,
+--               RawProcessSubstitute, RawWatchOperation,
+--               RawWatchProperty
+--   Aggregated: HistoryChain, HistoryJob, ProcessChain,
+--               ProcessGroup, ProcessInfo, ProcessStep,
+--               ProcessSubstitute, WatchOperation,
+--               WatchProperty
+--   Metadata:   SourceColumn, SourceDatabase, SourceTable
+--               (never deleted)
 --
--- HDB Tables (from OIM Data Archiving Administration Guide):
---
---   Raw data (bulk):
---     RawJobHistory, RawProcess, RawProcessChain,
---     RawProcessGroup, RawProcessStep, RawProcessSubstitute,
---     RawWatchOperation, RawWatchProperty
---
---   Aggregated data:
---     HistoryChain, HistoryJob, ProcessChain, ProcessGroup,
---     ProcessInfo, ProcessStep, ProcessSubstitute,
---     WatchOperation, WatchProperty
---
---   Metadata (DO NOT DELETE):
---     SourceColumn, SourceDatabase, SourceTable
---
--- ⚠️ BACKUP YOUR DATABASE BEFORE RUNNING THIS SCRIPT
+-- BACKUP YOUR DATABASE BEFORE RUNNING THIS SCRIPT
 -- ============================================================
 
--- CHANGE THIS to your actual History Database name
-USE [OneIMHDB3]
+USE [OneIMHDB3]   -- << CHANGE THIS to your HDB name
 GO
 
 SET NOCOUNT ON
@@ -37,655 +28,508 @@ GO
 -- ============================================================
 -- CONFIGURATION
 -- ============================================================
-DECLARE @CutoffDate        DATETIME    = DATEADD(YEAR, -2, GETDATE())
-DECLARE @BatchSize         INT         = 50000           -- starting default; overridden by benchmark if enabled
-DECLARE @Deleted           INT
-DECLARE @WhatIf            BIT         = 0
-DECLARE @PreviewLimit      INT         = 0               -- 0 = return all rows in WhatIf preview
-DECLARE @BatchDelay        VARCHAR(12) = '00:00:00'      -- pause between batches (HH:MM:SS), e.g. '00:00:01'
-DECLARE @CreateTempIndexes BIT         = 1               -- create temp non-clustered indexes on date cols before delete
-DECLARE @BenchmarkBatchSize BIT        = 1               -- auto-test batch sizes and pick fastest (set 0 to skip)
+DECLARE @CutoffDate  DATETIME = DATEADD(YEAR, -2, GETDATE())
+DECLARE @BatchSize   INT      = 50000
+DECLARE @WhatIf      BIT      = 0       -- 1 = preview only, no deletes
+DECLARE @BatchDelay  VARCHAR(12) = '00:00:00'  -- pause between batches
 
 PRINT '================================================'
 PRINT 'OIM History Database Cleanup'
 PRINT 'Database:    ' + DB_NAME()
 PRINT 'Cutoff date: ' + CONVERT(VARCHAR(20), @CutoffDate, 120)
 PRINT 'Batch size:  ' + CAST(@BatchSize AS VARCHAR)
-PRINT 'Batch delay: ' + @BatchDelay
-PRINT 'Temp indexes:' + CAST(@CreateTempIndexes AS VARCHAR)
-PRINT 'Benchmark:   ' + CAST(@BenchmarkBatchSize AS VARCHAR)
 PRINT 'WhatIf:      ' + CAST(@WhatIf AS VARCHAR)
-PRINT 'PreviewLimit:' + CAST(@PreviewLimit AS VARCHAR)
 PRINT '================================================'
 PRINT ''
 
 -- ============================================================
--- PRE-FLIGHT: Count rows to purge per table
+-- HELPER VARIABLES
 -- ============================================================
-PRINT '# PRE-FLIGHT SUMMARY'
-PRINT '================================================'
-
--- We dynamically find the best date column per table.
--- OIM HDB tables typically use columns like:
---   XDateInserted, XDateUpdated, StartDate, EndDate, etc.
--- We scan for the first available datetime column per table.
-
-DECLARE @TableName   NVARCHAR(256)
-DECLARE @DateCol     NVARCHAR(256)
-DECLARE @SQL         NVARCHAR(MAX)
-DECLARE @RowCount    BIGINT
-DECLARE @PurgeCount  BIGINT
-
--- Tables to clean (everything except Source* metadata and non-HDB tables)
-DECLARE @Tables TABLE (
-    TableName  NVARCHAR(256),
-    DateColumn NVARCHAR(256)
-)
-
--- FK-join delete definitions for tables that have NO date column.
--- These are purged by joining to their parent table's date column.
-DECLARE @FKJoinDeletes TABLE (
-    ChildTable    NVARCHAR(256),
-    ParentTable   NVARCHAR(256),
-    ChildFK       NVARCHAR(256),
-    ParentPK      NVARCHAR(256),
-    ParentDateCol NVARCHAR(256)  -- resolved below
-)
-INSERT INTO @FKJoinDeletes (ChildTable, ParentTable, ChildFK, ParentPK) VALUES
-    ('WatchProperty',       'WatchOperation',  'UID_DialogWatchOperation', 'UID_DialogWatchOperation'),
-    ('ProcessSubstitute',   'ProcessInfo',     'UID_ProcessInfoNew',       'UID_ProcessInfo'),
-    ('RawWatchProperty',    'RawWatchOperation','UID_DialogWatchOperation', 'UID_DialogWatchOperation'),
-    ('RawProcessSubstitute','RawProcess',       'GenProcIDNew',             'GenProcID')
-
--- Discover date columns for each cleanable table
-DECLARE disco_cur CURSOR LOCAL FAST_FORWARD FOR
-    SELECT t.name
-    FROM sys.tables t
-    WHERE t.name NOT IN ('SourceColumn', 'SourceDatabase', 'SourceTable',
-                          'nsecauth', 'nsecimport', 'sysdiagrams')
-    ORDER BY t.name
-
-OPEN disco_cur
-FETCH NEXT FROM disco_cur INTO @TableName
-WHILE @@FETCH_STATUS = 0
-BEGIN
-    -- Find the best date column using OIM HDB-specific priority:
-    --   OperationDate (WatchOperation), FirstDate (ProcessGroup/Info/HistoryChain),
-    --   XDateInserted (Raw*), ThisDate (ProcessChain/Step), StartAt (HistoryJob/RawJobHistory),
-    --   ExportDate (RawProcessGroup), then any other datetime column.
-    SET @DateCol = NULL
-
-    SELECT TOP 1 @DateCol = c.name
-    FROM sys.columns c
-    INNER JOIN sys.types ty ON c.user_type_id = ty.user_type_id
-    WHERE c.object_id = OBJECT_ID(@TableName)
-      AND ty.name IN ('datetime', 'datetime2', 'smalldatetime', 'date')
-    ORDER BY
-        CASE c.name
-            WHEN 'OperationDate'  THEN 1
-            WHEN 'FirstDate'      THEN 2
-            WHEN 'XDateInserted'  THEN 3
-            WHEN 'ThisDate'       THEN 4
-            WHEN 'StartAt'        THEN 5
-            WHEN 'ExportDate'     THEN 6
-            WHEN 'XDateUpdated'   THEN 7
-            ELSE 10
-        END,
-        c.column_id
-
-    IF @DateCol IS NOT NULL
-        INSERT INTO @Tables (TableName, DateColumn) VALUES (@TableName, @DateCol)
-    ELSE IF EXISTS (SELECT 1 FROM @FKJoinDeletes WHERE ChildTable = @TableName)
-        PRINT '  INFO ' + @TableName + ' has no date column — will purge via FK join'
-    ELSE
-        PRINT '  SKIP ' + @TableName + ' (no date column found)'
-
-    FETCH NEXT FROM disco_cur INTO @TableName
-END
-CLOSE disco_cur
-DEALLOCATE disco_cur
-
--- Resolve parent date columns for FK-join tables
-UPDATE fk
-SET fk.ParentDateCol = t.DateColumn
-FROM @FKJoinDeletes fk
-INNER JOIN @Tables t ON fk.ParentTable = t.TableName
+DECLARE @Deleted INT
+DECLARE @Total   BIGINT
+DECLARE @Start   DATETIME
+DECLARE @Sec     INT
+DECLARE @Rate    BIGINT
 
 -- ============================================================
--- HELPER: Create temp indexes on date columns EARLY so that
--- pre-flight MIN/MAX, benchmark, and batched deletes all
--- benefit from indexed access instead of full table scans.
+-- PRE-FLIGHT: Show estimated row counts per table
+-- (uses partition stats -- instant, no table scans)
 -- ============================================================
-DECLARE @IdxSQL NVARCHAR(MAX)
-DECLARE @TempIndexes TABLE (IndexName NVARCHAR(256), TableName NVARCHAR(256))
+PRINT '# PRE-FLIGHT (estimated row counts)'
+PRINT '------------------------------------------------'
 
-IF @WhatIf = 0 AND @CreateTempIndexes = 1
-BEGIN
-    PRINT '# TEMP INDEX CREATION'
-    PRINT '================================================'
+DECLARE @PreTbl NVARCHAR(128)
+DECLARE @PreCnt BIGINT
+DECLARE pre_cur CURSOR LOCAL FAST_FORWARD FOR
+    SELECT name FROM sys.tables
+    WHERE name IN (
+        'RawWatchProperty','RawWatchOperation','RawProcessStep',
+        'RawProcessSubstitute','RawProcessChain','RawProcess',
+        'RawProcessGroup','RawJobHistory',
+        'WatchProperty','WatchOperation','ProcessStep',
+        'ProcessSubstitute','ProcessChain','HistoryJob',
+        'HistoryChain','ProcessInfo','ProcessGroup'
+    )
+    ORDER BY name
 
-    -- First, clean up any stale IX_Cleanup_* indexes left from prior cancelled runs
-    DECLARE @StaleIdx NVARCHAR(256), @StaleTbl NVARCHAR(256)
-    DECLARE stale_cur CURSOR LOCAL FAST_FORWARD FOR
-        SELECT i.name, OBJECT_NAME(i.object_id)
-        FROM sys.indexes i
-        WHERE i.name LIKE 'IX_Cleanup_%'
-          AND i.type = 2 -- nonclustered
-    OPEN stale_cur
-    FETCH NEXT FROM stale_cur INTO @StaleIdx, @StaleTbl
-    WHILE @@FETCH_STATUS = 0
-    BEGIN
-        BEGIN TRY
-            SET @IdxSQL = N'DROP INDEX [' + @StaleIdx + N'] ON [' + @StaleTbl + N']'
-            EXEC sp_executesql @IdxSQL
-            PRINT '  Dropped stale index ' + @StaleIdx + ' on ' + @StaleTbl
-        END TRY
-        BEGIN CATCH
-            PRINT '  WARN Could not drop stale ' + @StaleIdx + ': ' + ERROR_MESSAGE()
-        END CATCH
-        FETCH NEXT FROM stale_cur INTO @StaleIdx, @StaleTbl
-    END
-    CLOSE stale_cur
-    DEALLOCATE stale_cur
-
-    DECLARE idx_cur CURSOR LOCAL FAST_FORWARD FOR
-        SELECT TableName, DateColumn FROM @Tables
-
-    OPEN idx_cur
-    FETCH NEXT FROM idx_cur INTO @TableName, @DateCol
-    WHILE @@FETCH_STATUS = 0
-    BEGIN
-        -- Only create if no existing index has this date column as leading key
-        IF NOT EXISTS (
-            SELECT 1 FROM sys.index_columns ic
-            INNER JOIN sys.indexes i ON ic.object_id = i.object_id AND ic.index_id = i.index_id
-            WHERE ic.object_id = OBJECT_ID(@TableName)
-              AND ic.column_id = (
-                  SELECT column_id FROM sys.columns
-                  WHERE object_id = OBJECT_ID(@TableName) AND name = @DateCol
-              )
-              AND ic.key_ordinal = 1
-        )
-        BEGIN
-            DECLARE @IdxName NVARCHAR(256) = N'IX_Cleanup_' + @TableName + N'_' + @DateCol
-            PRINT '  Creating temp index ' + @IdxName + '...'
-            SET @IdxSQL = N'CREATE NONCLUSTERED INDEX [' + @IdxName + N'] ON [' + @TableName + N'] ([' + @DateCol + N'])'
-            BEGIN TRY
-                EXEC sp_executesql @IdxSQL
-                INSERT INTO @TempIndexes (IndexName, TableName) VALUES (@IdxName, @TableName)
-                PRINT '  OK ' + @IdxName
-            END TRY
-            BEGIN CATCH
-                PRINT '  WARN Could not create index ' + @IdxName + ': ' + ERROR_MESSAGE()
-            END CATCH
-        END
-        ELSE
-            PRINT '  Index already exists on ' + @TableName + '.' + @DateCol + ' -- skipping'
-
-        FETCH NEXT FROM idx_cur INTO @TableName, @DateCol
-    END
-    CLOSE idx_cur
-    DEALLOCATE idx_cur
-
-    -- Also create indexes on FK child columns for FK-join deletes
-    -- (e.g. WatchProperty.UID_DialogWatchOperation) to speed up join-based deletes
-    DECLARE @FKIdxChild NVARCHAR(256), @FKIdxCol NVARCHAR(256)
-    DECLARE fk_idx_cur CURSOR LOCAL FAST_FORWARD FOR
-        SELECT ChildTable, ChildFK FROM @FKJoinDeletes WHERE ParentDateCol IS NOT NULL
-    OPEN fk_idx_cur
-    FETCH NEXT FROM fk_idx_cur INTO @FKIdxChild, @FKIdxCol
-    WHILE @@FETCH_STATUS = 0
-    BEGIN
-        IF OBJECT_ID(@FKIdxChild, 'U') IS NOT NULL
-        AND NOT EXISTS (
-            SELECT 1 FROM sys.index_columns ic
-            INNER JOIN sys.indexes i ON ic.object_id = i.object_id AND ic.index_id = i.index_id
-            WHERE ic.object_id = OBJECT_ID(@FKIdxChild)
-              AND ic.column_id = (SELECT column_id FROM sys.columns WHERE object_id = OBJECT_ID(@FKIdxChild) AND name = @FKIdxCol)
-              AND ic.key_ordinal = 1
-        )
-        BEGIN
-            DECLARE @FKIdxName NVARCHAR(256) = N'IX_Cleanup_' + @FKIdxChild + N'_' + @FKIdxCol
-            PRINT '  Creating FK child index ' + @FKIdxName + '...'
-            SET @IdxSQL = N'CREATE NONCLUSTERED INDEX [' + @FKIdxName + N'] ON [' + @FKIdxChild + N'] ([' + @FKIdxCol + N'])'
-            BEGIN TRY
-                EXEC sp_executesql @IdxSQL
-                INSERT INTO @TempIndexes (IndexName, TableName) VALUES (@FKIdxName, @FKIdxChild)
-                PRINT '  OK ' + @FKIdxName
-            END TRY
-            BEGIN CATCH
-                PRINT '  WARN Could not create index ' + @FKIdxName + ': ' + ERROR_MESSAGE()
-            END CATCH
-        END
-        ELSE IF OBJECT_ID(@FKIdxChild, 'U') IS NOT NULL
-            PRINT '  Index already exists on ' + @FKIdxChild + '.' + @FKIdxCol + ' -- skipping'
-        FETCH NEXT FROM fk_idx_cur INTO @FKIdxChild, @FKIdxCol
-    END
-    CLOSE fk_idx_cur
-    DEALLOCATE fk_idx_cur
-
-    PRINT ''
-END
-
--- Show pre-flight counts — tables with their own date column
--- Uses sys.dm_db_partition_stats for instant row counts (no table scan)
--- and MIN/MAX on date column (now index-backed if temp indexes were created).
-DECLARE preflight_cur CURSOR LOCAL FAST_FORWARD FOR
-    SELECT TableName, DateColumn FROM @Tables ORDER BY TableName
-
-OPEN preflight_cur
-FETCH NEXT FROM preflight_cur INTO @TableName, @DateCol
+OPEN pre_cur
+FETCH NEXT FROM pre_cur INTO @PreTbl
 WHILE @@FETCH_STATUS = 0
 BEGIN
-    SET @SQL = N'SELECT @total = SUM(p.row_count) ' +
-        N'FROM sys.dm_db_partition_stats p ' +
-        N'WHERE p.object_id = OBJECT_ID(''' + @TableName + N''') AND p.index_id IN (0,1)'
-    EXEC sp_executesql @SQL, N'@total BIGINT OUTPUT', @RowCount OUTPUT
+    SELECT @PreCnt = SUM(p.row_count)
+    FROM sys.dm_db_partition_stats p
+    WHERE p.object_id = OBJECT_ID(@PreTbl) AND p.index_id IN (0,1)
 
-    -- Quick MIN/MAX to show date range (uses temp index if available)
-    DECLARE @MinDate VARCHAR(20) = '?', @MaxDate VARCHAR(20) = '?'
-    SET @SQL = N'SELECT @mn = CONVERT(VARCHAR(20), MIN([' + @DateCol + N']), 120), ' +
-        N'@mx = CONVERT(VARCHAR(20), MAX([' + @DateCol + N']), 120) FROM [' + @TableName + N']'
-    EXEC sp_executesql @SQL,
-        N'@mn VARCHAR(20) OUTPUT, @mx VARCHAR(20) OUTPUT',
-        @MinDate OUTPUT, @MaxDate OUTPUT
-
-    PRINT '  ' + @TableName + ': ~' + CAST(ISNULL(@RowCount, 0) AS VARCHAR) + ' rows (' + @DateCol + ': ' + ISNULL(@MinDate, '?') + ' to ' + ISNULL(@MaxDate, '?') + ')'
-
-    FETCH NEXT FROM preflight_cur INTO @TableName, @DateCol
+    PRINT '  ' + @PreTbl + ': ~' + CAST(ISNULL(@PreCnt,0) AS VARCHAR) + ' rows'
+    FETCH NEXT FROM pre_cur INTO @PreTbl
 END
-CLOSE preflight_cur
-DEALLOCATE preflight_cur
-
--- Show pre-flight counts — FK-joined tables (estimated row counts only)
-DECLARE @FKChild   NVARCHAR(256)
-DECLARE @FKParent  NVARCHAR(256)
-DECLARE @FKChildCol NVARCHAR(256)
-DECLARE @FKParentCol NVARCHAR(256)
-DECLARE @FKDateCol  NVARCHAR(256)
-
-DECLARE fk_pre CURSOR LOCAL FAST_FORWARD FOR
-    SELECT ChildTable, ParentTable, ChildFK, ParentPK, ParentDateCol
-    FROM @FKJoinDeletes WHERE ParentDateCol IS NOT NULL ORDER BY ChildTable
-
-OPEN fk_pre
-FETCH NEXT FROM fk_pre INTO @FKChild, @FKParent, @FKChildCol, @FKParentCol, @FKDateCol
-WHILE @@FETCH_STATUS = 0
-BEGIN
-    IF OBJECT_ID(@FKChild, 'U') IS NOT NULL
-    BEGIN
-        SET @SQL = N'SELECT @total = SUM(p.row_count) ' +
-            N'FROM sys.dm_db_partition_stats p ' +
-            N'WHERE p.object_id = OBJECT_ID(''' + @FKChild + N''') AND p.index_id IN (0,1)'
-        EXEC sp_executesql @SQL, N'@total BIGINT OUTPUT', @RowCount OUTPUT
-        PRINT '  ' + @FKChild + ': ~' + CAST(ISNULL(@RowCount, 0) AS VARCHAR) + ' rows (purge via ' + @FKParent + '.' + @FKDateCol + ')'
-    END
-    FETCH NEXT FROM fk_pre INTO @FKChild, @FKParent, @FKChildCol, @FKParentCol, @FKDateCol
-END
-CLOSE fk_pre
-DEALLOCATE fk_pre
-
+CLOSE pre_cur
+DEALLOCATE pre_cur
 PRINT ''
-PRINT '================================================'
+
+-- ============================================================
+-- WHATIF -- stop here if preview mode
+-- ============================================================
+IF @WhatIf = 1
+BEGIN
+    PRINT 'WhatIf mode -- no data deleted.'
+    RETURN
+END
+
 PRINT '# CLEANUP'
 PRINT '================================================'
 
 -- ============================================================
--- BENCHMARK: Test multiple batch sizes on the largest table
--- to find the optimal throughput for this server's hardware.
--- Deletes real rows (they need to go anyway) during the test.
+-- DELETE in FK-safe order (children before parents).
+-- Four tables have no date column and are deleted via
+-- JOIN to their parent table.
+--
+-- Order:
+--   1. RawWatchProperty     (FK join -> RawWatchOperation)
+--   2. RawWatchOperation    (OperationDate)
+--   3. RawProcessStep       (XDateInserted)
+--   4. RawProcessSubstitute (FK join -> RawProcess)
+--   5. RawProcessChain      (XDateInserted)
+--   6. RawProcess           (XDateInserted)
+--   7. RawProcessGroup      (ExportDate)
+--   8. RawJobHistory        (StartAt)
+--   9. WatchProperty        (FK join -> WatchOperation)
+--  10. WatchOperation       (OperationDate)
+--  11. ProcessStep          (ThisDate)
+--  12. ProcessSubstitute    (FK join -> ProcessInfo)
+--  13. ProcessChain         (ThisDate)
+--  14. HistoryJob           (StartAt)
+--  15. HistoryChain         (FirstDate)
+--  16. ProcessInfo          (FirstDate)
+--  17. ProcessGroup         (FirstDate)
 -- ============================================================
-IF @WhatIf = 0 AND @BenchmarkBatchSize = 1
+
+-- 1. RawWatchProperty (FK join -> RawWatchOperation.OperationDate)
+IF OBJECT_ID('RawWatchProperty','U') IS NOT NULL
+AND OBJECT_ID('RawWatchOperation','U') IS NOT NULL
 BEGIN
-    DECLARE @BenchTable   NVARCHAR(256)
-    DECLARE @BenchDateCol NVARCHAR(256)
-    DECLARE @BenchPurge   BIGINT
-
-    DECLARE @BenchSQL NVARCHAR(MAX)
-    DECLARE @BestRate BIGINT = 0
-    DECLARE @BestSize INT   = @BatchSize
-
-    -- Find table with most rows to purge — must be a LEAF table
-    -- (no FK references pointing TO it) to avoid constraint errors.
-    -- Uses estimated row counts from partition stats (instant, no scan).
-    DECLARE @BenchCandidates TABLE (TableName NVARCHAR(256), DateColumn NVARCHAR(256), PurgeCount BIGINT)
-    DECLARE @BenchTbl NVARCHAR(256), @BenchCol NVARCHAR(256)
-    DECLARE @BenchCnt BIGINT
-
-    DECLARE bench_disco CURSOR LOCAL FAST_FORWARD FOR
-        SELECT t.TableName, t.DateColumn
-        FROM @Tables t
-        WHERE NOT EXISTS (
-            -- Exclude tables referenced as parent by any FK constraint
-            SELECT 1 FROM sys.foreign_keys fk
-            WHERE fk.referenced_object_id = OBJECT_ID(t.TableName)
-        )
-    OPEN bench_disco
-    FETCH NEXT FROM bench_disco INTO @BenchTbl, @BenchCol
-    WHILE @@FETCH_STATUS = 0
+    PRINT 'Cleaning RawWatchProperty (via RawWatchOperation.OperationDate)...'
+    SET @Total = 0  SET @Start = GETDATE()  SET @Deleted = 1
+    WHILE @Deleted > 0
     BEGIN
-        -- Use estimated row count (instant) as upper bound for purge candidates
-        SET @BenchSQL = N'SELECT @cnt = SUM(p.row_count) FROM sys.dm_db_partition_stats p WHERE p.object_id = OBJECT_ID(''' + @BenchTbl + N''') AND p.index_id IN (0,1)'
-        SET @BenchCnt = 0
-        EXEC sp_executesql @BenchSQL, N'@cnt BIGINT OUTPUT', @BenchCnt OUTPUT
-        INSERT INTO @BenchCandidates VALUES (@BenchTbl, @BenchCol, ISNULL(@BenchCnt, 0))
-        FETCH NEXT FROM bench_disco INTO @BenchTbl, @BenchCol
-    END
-    CLOSE bench_disco
-    DEALLOCATE bench_disco
-
-    SELECT TOP 1 @BenchTable = TableName, @BenchDateCol = DateColumn, @BenchPurge = PurgeCount
-    FROM @BenchCandidates ORDER BY PurgeCount DESC
-
-    IF @BenchPurge >= 100000  -- need enough rows for a meaningful test
-    BEGIN
-        PRINT ''
-        PRINT '================================================'
-        PRINT '# BATCH SIZE BENCHMARK'
-        PRINT '================================================'
-        PRINT 'Target table: ' + @BenchTable + ' (' + CAST(@BenchPurge AS VARCHAR) + ' rows to purge)'
-        PRINT 'Date column:  ' + @BenchDateCol
-        PRINT ''
-        PRINT 'Testing batch sizes (2 trial batches each, early exit)...'
-        PRINT '------------------------------------------------'
-
-        DECLARE @TestSizes TABLE (TestSize INT)
-        INSERT INTO @TestSizes VALUES (10000),(50000),(100000),(250000),(500000)
-
-        DECLARE @TestSize      INT
-        DECLARE @TrialDeleted  INT
-        DECLARE @TrialTotal    BIGINT
-        DECLARE @TrialStart    DATETIME
-        DECLARE @TrialMs       BIGINT
-        DECLARE @TrialRate     BIGINT
-
-        DECLARE bench_cur CURSOR LOCAL FAST_FORWARD FOR
-            SELECT TestSize FROM @TestSizes ORDER BY TestSize
-        OPEN bench_cur
-        FETCH NEXT FROM bench_cur INTO @TestSize
-        DECLARE @BenchRowsDeleted BIGINT = 0  -- track total deleted across all sizes
-        DECLARE @PrevRate BIGINT = 0           -- previous test's rate
-        DECLARE @Declines INT = 0              -- consecutive throughput declines
-        WHILE @@FETCH_STATUS = 0
+        DELETE TOP (@BatchSize) child
+        FROM RawWatchProperty child
+        INNER JOIN RawWatchOperation parent
+            ON child.UID_DialogWatchOperation = parent.UID_DialogWatchOperation
+        WHERE parent.OperationDate < @CutoffDate
+        SET @Deleted = @@ROWCOUNT
+        SET @Total = @Total + @Deleted
+        IF @Deleted > 0
         BEGIN
-            -- Skip if we've already deleted most rows (estimate remaining)
-            IF (@BenchPurge - @BenchRowsDeleted) < @TestSize
-            BEGIN
-                PRINT '  ' + CAST(@TestSize AS VARCHAR(10)) + ': SKIP (~' + CAST(@BenchPurge - @BenchRowsDeleted AS VARCHAR) + ' rows remain)'
-                FETCH NEXT FROM bench_cur INTO @TestSize
-                CONTINUE
-            END
-
-            SET @TrialTotal = 0
-            SET @TrialStart = GETDATE()
-
-            -- Two trial batches per size
-            DECLARE @Trial INT = 0
-            WHILE @Trial < 2
-            BEGIN
-                SET @BenchSQL = N'DELETE TOP (' + CAST(@TestSize AS NVARCHAR) + N') FROM [' + @BenchTable + N'] WHERE [' + @BenchDateCol + N'] < @cutoff'
-                EXEC sp_executesql @BenchSQL, N'@cutoff DATETIME', @CutoffDate
-                SET @TrialDeleted = @@ROWCOUNT
-                SET @TrialTotal = @TrialTotal + @TrialDeleted
-                CHECKPOINT
-                IF @TrialDeleted = 0 BREAK
-                SET @Trial = @Trial + 1
-            END
-
-            SET @BenchRowsDeleted = @BenchRowsDeleted + @TrialTotal
-
-            SET @TrialMs = DATEDIFF(MILLISECOND, @TrialStart, GETDATE())
-            SET @TrialRate = CASE WHEN @TrialMs > 0 THEN (@TrialTotal * 1000) / @TrialMs ELSE 0 END
-
-            DECLARE @EstHours VARCHAR(20) = ''
-            IF @TrialRate > 0
-            BEGIN
-                DECLARE @EstSec BIGINT = (@BenchPurge - @BenchRowsDeleted) / @TrialRate
-                SET @EstHours = CAST(@EstSec / 3600 AS VARCHAR) + 'h ' + CAST((@EstSec % 3600) / 60 AS VARCHAR) + 'm'
-            END
-
-            PRINT '  ' + RIGHT('       ' + CAST(@TestSize AS VARCHAR(10)), 7) +
-                  ': ' + CAST(@TrialTotal AS VARCHAR) + ' rows in ' + CAST(@TrialMs AS VARCHAR) + 'ms' +
-                  ' = ~' + CAST(@TrialRate AS VARCHAR) + ' rows/sec' +
-                  '  (est. total: ' + @EstHours + ')'
-
-            IF @TrialRate > @BestRate
-            BEGIN
-                SET @BestRate = @TrialRate
-                SET @BestSize = @TestSize
-                SET @Declines = 0
-            END
-            ELSE
-            BEGIN
-                SET @Declines = @Declines + 1
-                IF @Declines >= 2
-                BEGIN
-                    PRINT '  (early exit — throughput declining)'
-                    BREAK
-                END
-            END
-            SET @PrevRate = @TrialRate
-
-            FETCH NEXT FROM bench_cur INTO @TestSize
+            CHECKPOINT
+            SET @Sec = DATEDIFF(SECOND, @Start, GETDATE())
+            SET @Rate = CASE WHEN @Sec > 0 THEN @Total / @Sec ELSE 0 END
+            PRINT '  batch ' + CAST(@Deleted AS VARCHAR) + ' | total ' + CAST(@Total AS VARCHAR) + ' | ' + CAST(@Sec AS VARCHAR) + 's | ~' + CAST(@Rate AS VARCHAR) + ' rows/sec'
+            IF @BatchDelay <> '00:00:00' WAITFOR DELAY @BatchDelay
         END
-        CLOSE bench_cur
-        DEALLOCATE bench_cur
-
-        PRINT '------------------------------------------------'
-        PRINT 'Winner: ' + CAST(@BestSize AS VARCHAR) + ' rows/batch (~' + CAST(@BestRate AS VARCHAR) + ' rows/sec)'
-
-        -- Apply the winning batch size
-        SET @BatchSize = @BestSize
-        PRINT 'Using @BatchSize = ' + CAST(@BatchSize AS VARCHAR) + ' for remaining cleanup.'
-        PRINT '================================================'
-        PRINT ''
     END
-    ELSE
-    BEGIN
-        PRINT ''
-        PRINT 'Benchmark skipped: largest table has < 100K rows to purge (' + CAST(ISNULL(@BenchPurge, 0) AS VARCHAR) + ')'
-        PRINT 'Using default @BatchSize = ' + CAST(@BatchSize AS VARCHAR)
-        PRINT ''
-    END
+    PRINT '  Done: ' + CAST(@Total AS VARCHAR) + ' rows removed.'
 END
+PRINT ''
 
--- ============================================================
--- DELETE in dependency-safe order
--- Child tables (Raw*) before aggregated parent tables.
--- WatchProperty before WatchOperation, etc.
--- ============================================================
-
--- Define delete order (children first, parents last)
-DECLARE @DeleteOrder TABLE (
-    Seq        INT IDENTITY(1,1),
-    TableName  NVARCHAR(256)
-)
-
--- Raw tables first (children of aggregated tables)
-INSERT INTO @DeleteOrder (TableName) VALUES ('RawWatchProperty')
-INSERT INTO @DeleteOrder (TableName) VALUES ('RawWatchOperation')
-INSERT INTO @DeleteOrder (TableName) VALUES ('RawProcessStep')
-INSERT INTO @DeleteOrder (TableName) VALUES ('RawProcessSubstitute')
-INSERT INTO @DeleteOrder (TableName) VALUES ('RawProcessChain')
-INSERT INTO @DeleteOrder (TableName) VALUES ('RawProcess')
-INSERT INTO @DeleteOrder (TableName) VALUES ('RawProcessGroup')
-INSERT INTO @DeleteOrder (TableName) VALUES ('RawJobHistory')
--- Aggregated tables (parents)
-INSERT INTO @DeleteOrder (TableName) VALUES ('WatchProperty')
-INSERT INTO @DeleteOrder (TableName) VALUES ('WatchOperation')
-INSERT INTO @DeleteOrder (TableName) VALUES ('ProcessStep')
-INSERT INTO @DeleteOrder (TableName) VALUES ('ProcessSubstitute')
-INSERT INTO @DeleteOrder (TableName) VALUES ('ProcessChain')
-INSERT INTO @DeleteOrder (TableName) VALUES ('HistoryJob')
-INSERT INTO @DeleteOrder (TableName) VALUES ('HistoryChain')
-INSERT INTO @DeleteOrder (TableName) VALUES ('ProcessInfo')
-INSERT INTO @DeleteOrder (TableName) VALUES ('ProcessGroup')
-
--- ============================================================
--- WHATIF PREVIEW (optional)
--- ============================================================
-IF @WhatIf = 1
+-- 2. RawWatchOperation (OperationDate)
+IF OBJECT_ID('RawWatchOperation','U') IS NOT NULL
 BEGIN
-    PRINT ''
-    PRINT '================================================'
-    PRINT '# WHATIF PREVIEW — Rows that WOULD be deleted'
-    PRINT '================================================'
-
-    DECLARE @TopClause NVARCHAR(50) = CASE WHEN @PreviewLimit > 0
-        THEN 'TOP (' + CAST(@PreviewLimit AS NVARCHAR(20)) + ') '
-        ELSE '' END
-
-    DECLARE preview_cur CURSOR LOCAL FAST_FORWARD FOR
-        SELECT TableName FROM @DeleteOrder ORDER BY Seq
-
-    OPEN preview_cur
-    FETCH NEXT FROM preview_cur INTO @TableName
-    WHILE @@FETCH_STATUS = 0
+    PRINT 'Cleaning RawWatchOperation...'
+    SET @Total = 0  SET @Start = GETDATE()  SET @Deleted = 1
+    WHILE @Deleted > 0
     BEGIN
-        IF OBJECT_ID(@TableName, 'U') IS NULL
+        DELETE TOP (@BatchSize) FROM RawWatchOperation WHERE OperationDate < @CutoffDate
+        SET @Deleted = @@ROWCOUNT
+        SET @Total = @Total + @Deleted
+        IF @Deleted > 0
         BEGIN
-            FETCH NEXT FROM preview_cur INTO @TableName
-            CONTINUE
+            CHECKPOINT
+            SET @Sec = DATEDIFF(SECOND, @Start, GETDATE())
+            SET @Rate = CASE WHEN @Sec > 0 THEN @Total / @Sec ELSE 0 END
+            PRINT '  batch ' + CAST(@Deleted AS VARCHAR) + ' | total ' + CAST(@Total AS VARCHAR) + ' | ' + CAST(@Sec AS VARCHAR) + 's | ~' + CAST(@Rate AS VARCHAR) + ' rows/sec'
+            IF @BatchDelay <> '00:00:00' WAITFOR DELAY @BatchDelay
         END
-
-        -- Determine date column for direct delete preview
-        SET @DateCol = NULL
-        SELECT @DateCol = DateColumn FROM @Tables WHERE TableName = @TableName
-
-        -- FK-join preview
-        IF EXISTS (SELECT 1 FROM @FKJoinDeletes WHERE ChildTable = @TableName AND ParentDateCol IS NOT NULL)
-        BEGIN
-            SELECT @FKChild = ChildTable, @FKParent = ParentTable,
-                   @FKChildCol = ChildFK, @FKParentCol = ParentPK,
-                   @FKDateCol = ParentDateCol
-            FROM @FKJoinDeletes WHERE ChildTable = @TableName
-
-            PRINT 'Preview ' + @TableName + ' (FK join -> ' + @FKParent + '.' + @FKDateCol + ' < cutoff)...'
-            SET @SQL = N'SELECT ' + @TopClause + N'''' + @TableName + N''' AS TableName, child.*, parent.[' + @FKDateCol + N'] AS ParentDate ' +
-                N'FROM [' + @TableName + N'] child ' +
-                N'INNER JOIN [' + @FKParent + N'] parent ON child.[' + @FKChildCol + N'] = parent.[' + @FKParentCol + N'] ' +
-                N'WHERE parent.[' + @FKDateCol + N'] < @cutoff ' +
-                N'ORDER BY parent.[' + @FKDateCol + N'] ASC'
-            EXEC sp_executesql @SQL, N'@cutoff DATETIME', @CutoffDate
-        END
-        ELSE IF @DateCol IS NOT NULL
-        BEGIN
-            PRINT 'Preview ' + @TableName + ' (WHERE ' + @DateCol + ' < cutoff)...'
-            SET @SQL = N'SELECT ' + @TopClause + N'''' + @TableName + N''' AS TableName, * FROM [' + @TableName + N'] ' +
-                N'WHERE [' + @DateCol + N'] < @cutoff ORDER BY [' + @DateCol + N'] ASC'
-            EXEC sp_executesql @SQL, N'@cutoff DATETIME', @CutoffDate
-        END
-        ELSE
-        BEGIN
-            PRINT 'SKIP ' + @TableName + ' (no date column and no FK-join rule)'
-        END
-
-        FETCH NEXT FROM preview_cur INTO @TableName
     END
-    CLOSE preview_cur
-    DEALLOCATE preview_cur
-
-    PRINT ''
-    PRINT '================================================'
-    PRINT 'WhatIf preview complete. No data was deleted.'
-    PRINT '================================================'
-    RETURN
+    PRINT '  Done: ' + CAST(@Total AS VARCHAR) + ' rows removed.'
 END
+PRINT ''
 
-DECLARE @Seq INT = 1
-DECLARE @MaxSeq INT = (SELECT MAX(Seq) FROM @DeleteOrder)
-
-WHILE @Seq <= @MaxSeq
+-- 3. RawProcessStep (XDateInserted)
+IF OBJECT_ID('RawProcessStep','U') IS NOT NULL
 BEGIN
-    SELECT @TableName = TableName FROM @DeleteOrder WHERE Seq = @Seq
-
-    -- Get the date column for this table
-    SET @DateCol = NULL
-    SELECT @DateCol = DateColumn FROM @Tables WHERE TableName = @TableName
-
-    IF OBJECT_ID(@TableName, 'U') IS NULL
+    PRINT 'Cleaning RawProcessStep...'
+    SET @Total = 0  SET @Start = GETDATE()  SET @Deleted = 1
+    WHILE @Deleted > 0
     BEGIN
-        SET @Seq = @Seq + 1
-        CONTINUE
+        DELETE TOP (@BatchSize) FROM RawProcessStep WHERE XDateInserted < @CutoffDate
+        SET @Deleted = @@ROWCOUNT
+        SET @Total = @Total + @Deleted
+        IF @Deleted > 0
+        BEGIN
+            CHECKPOINT
+            SET @Sec = DATEDIFF(SECOND, @Start, GETDATE())
+            SET @Rate = CASE WHEN @Sec > 0 THEN @Total / @Sec ELSE 0 END
+            PRINT '  batch ' + CAST(@Deleted AS VARCHAR) + ' | total ' + CAST(@Total AS VARCHAR) + ' | ' + CAST(@Sec AS VARCHAR) + 's | ~' + CAST(@Rate AS VARCHAR) + ' rows/sec'
+            IF @BatchDelay <> '00:00:00' WAITFOR DELAY @BatchDelay
+        END
     END
+    PRINT '  Done: ' + CAST(@Total AS VARCHAR) + ' rows removed.'
+END
+PRINT ''
 
-    -- Check if this table uses FK-join delete (no date column)
-    IF EXISTS (SELECT 1 FROM @FKJoinDeletes WHERE ChildTable = @TableName AND ParentDateCol IS NOT NULL)
+-- 4. RawProcessSubstitute (FK join -> RawProcess.XDateInserted)
+IF OBJECT_ID('RawProcessSubstitute','U') IS NOT NULL
+AND OBJECT_ID('RawProcess','U') IS NOT NULL
+BEGIN
+    PRINT 'Cleaning RawProcessSubstitute (via RawProcess.XDateInserted)...'
+    SET @Total = 0  SET @Start = GETDATE()  SET @Deleted = 1
+    WHILE @Deleted > 0
     BEGIN
-        -- FK-join delete: direct batched JOIN delete (no upfront materialization)
-        -- At scale (627M+ child rows), materializing all keys into a temp table
-        -- is itself the bottleneck. Instead, delete directly via JOIN in batches.
-        SELECT @FKChild = ChildTable, @FKParent = ParentTable,
-               @FKChildCol = ChildFK, @FKParentCol = ParentPK,
-               @FKDateCol = ParentDateCol
-        FROM @FKJoinDeletes WHERE ChildTable = @TableName
+        DELETE TOP (@BatchSize) child
+        FROM RawProcessSubstitute child
+        INNER JOIN RawProcess parent ON child.GenProcIDNew = parent.GenProcID
+        WHERE parent.XDateInserted < @CutoffDate
+        SET @Deleted = @@ROWCOUNT
+        SET @Total = @Total + @Deleted
+        IF @Deleted > 0
+        BEGIN
+            CHECKPOINT
+            SET @Sec = DATEDIFF(SECOND, @Start, GETDATE())
+            SET @Rate = CASE WHEN @Sec > 0 THEN @Total / @Sec ELSE 0 END
+            PRINT '  batch ' + CAST(@Deleted AS VARCHAR) + ' | total ' + CAST(@Total AS VARCHAR) + ' | ' + CAST(@Sec AS VARCHAR) + 's | ~' + CAST(@Rate AS VARCHAR) + ' rows/sec'
+            IF @BatchDelay <> '00:00:00' WAITFOR DELAY @BatchDelay
+        END
+    END
+    PRINT '  Done: ' + CAST(@Total AS VARCHAR) + ' rows removed.'
+END
+PRINT ''
 
-        PRINT 'Cleaning ' + @TableName + ' (FK join -> ' + @FKParent + '.' + @FKDateCol + ' < cutoff)...'
-        BEGIN TRY
-            SET @SQL = N'DECLARE @d INT = 1, @tot BIGINT = 0, @st DATETIME = GETDATE(); ' +
-                N'WHILE @d > 0 ' +
-                N'BEGIN ' +
-                N'  DELETE TOP (' + CAST(@BatchSize AS NVARCHAR) + N') child ' +
-                N'  FROM [' + @TableName + N'] child ' +
-                N'  INNER JOIN [' + @FKParent + N'] parent ' +
-                N'  ON child.[' + @FKChildCol + N'] = parent.[' + @FKParentCol + N'] ' +
-                N'  WHERE parent.[' + @FKDateCol + N'] < @cutoff; ' +
-                N'  SET @d = @@ROWCOUNT; ' +
-                N'  SET @tot = @tot + @d; ' +
-                N'  IF @d > 0 BEGIN ' +
-                N'    CHECKPOINT; ' +
-                N'    DECLARE @sec INT = DATEDIFF(SECOND, @st, GETDATE()); ' +
-                N'    DECLARE @r BIGINT = CASE WHEN @sec > 0 THEN @tot / @sec ELSE 0 END; ' +
-                N'    PRINT ''  Deleted batch: '' + CAST(@d AS VARCHAR) + '' | total: '' + CAST(@tot AS VARCHAR) + '' | '' + CAST(@sec AS VARCHAR) + ''s elapsed | ~'' + CAST(@r AS VARCHAR) + '' rows/sec''; ' +
-                N'    IF ''' + @BatchDelay + N''' <> ''00:00:00'' WAITFOR DELAY ''' + @BatchDelay + N'''; ' +
-                N'  END ' +
-                N'END; ' +
-                N'PRINT ''  Done. '' + CAST(@tot AS VARCHAR) + '' rows removed.''; '
-            EXEC sp_executesql @SQL, N'@cutoff DATETIME', @CutoffDate
-        END TRY
-        BEGIN CATCH
-            PRINT '  ERROR: ' + ERROR_MESSAGE()
-        END CATCH
-    END
-    ELSE IF @DateCol IS NOT NULL
+-- 5. RawProcessChain (XDateInserted)
+IF OBJECT_ID('RawProcessChain','U') IS NOT NULL
+BEGIN
+    PRINT 'Cleaning RawProcessChain...'
+    SET @Total = 0  SET @Start = GETDATE()  SET @Deleted = 1
+    WHILE @Deleted > 0
     BEGIN
-        -- Direct date-column delete
-        PRINT 'Cleaning ' + @TableName + ' (WHERE ' + @DateCol + ' < cutoff)...'
-        BEGIN TRY
-            SET @Deleted = 1
-            DECLARE @TotalDeleted BIGINT = 0
-            DECLARE @StartTime   DATETIME = GETDATE()
-            WHILE @Deleted > 0
-            BEGIN
-                SET @SQL = N'DELETE TOP (' + CAST(@BatchSize AS NVARCHAR) + N') FROM [' + @TableName + N'] WHERE [' + @DateCol + N'] < @cutoff'
-                EXEC sp_executesql @SQL, N'@cutoff DATETIME', @CutoffDate
-                SET @Deleted = @@ROWCOUNT
-                SET @TotalDeleted = @TotalDeleted + @Deleted
-                IF @Deleted > 0
-                BEGIN
-                    CHECKPOINT
-                    DECLARE @ElapsedSec INT  = DATEDIFF(SECOND, @StartTime, GETDATE())
-                    DECLARE @Rate       BIGINT = CASE WHEN @ElapsedSec > 0 THEN @TotalDeleted / @ElapsedSec ELSE 0 END
-                    PRINT '  Deleted batch: ' + CAST(@Deleted AS VARCHAR) +
-                          ' | total: ' + CAST(@TotalDeleted AS VARCHAR) +
-                          ' | ' + CAST(@ElapsedSec AS VARCHAR) + 's elapsed' +
-                          ' | ~' + CAST(@Rate AS VARCHAR) + ' rows/sec'
-                    IF @BatchDelay <> '00:00:00'
-                        WAITFOR DELAY @BatchDelay
-                END
-            END
-            PRINT '  Done. ' + CAST(@TotalDeleted AS VARCHAR) + ' rows removed.'
-        END TRY
-        BEGIN CATCH
-            PRINT '  ERROR: ' + ERROR_MESSAGE()
-        END CATCH
+        DELETE TOP (@BatchSize) FROM RawProcessChain WHERE XDateInserted < @CutoffDate
+        SET @Deleted = @@ROWCOUNT
+        SET @Total = @Total + @Deleted
+        IF @Deleted > 0
+        BEGIN
+            CHECKPOINT
+            SET @Sec = DATEDIFF(SECOND, @Start, GETDATE())
+            SET @Rate = CASE WHEN @Sec > 0 THEN @Total / @Sec ELSE 0 END
+            PRINT '  batch ' + CAST(@Deleted AS VARCHAR) + ' | total ' + CAST(@Total AS VARCHAR) + ' | ' + CAST(@Sec AS VARCHAR) + 's | ~' + CAST(@Rate AS VARCHAR) + ' rows/sec'
+            IF @BatchDelay <> '00:00:00' WAITFOR DELAY @BatchDelay
+        END
     END
-    ELSE
-    BEGIN
-        PRINT 'SKIP ' + @TableName + ' (no date column and no FK-join rule)'
-    END
+    PRINT '  Done: ' + CAST(@Total AS VARCHAR) + ' rows removed.'
+END
+PRINT ''
 
-    SET @Seq = @Seq + 1
+-- 6. RawProcess (XDateInserted)
+IF OBJECT_ID('RawProcess','U') IS NOT NULL
+BEGIN
+    PRINT 'Cleaning RawProcess...'
+    SET @Total = 0  SET @Start = GETDATE()  SET @Deleted = 1
+    WHILE @Deleted > 0
+    BEGIN
+        DELETE TOP (@BatchSize) FROM RawProcess WHERE XDateInserted < @CutoffDate
+        SET @Deleted = @@ROWCOUNT
+        SET @Total = @Total + @Deleted
+        IF @Deleted > 0
+        BEGIN
+            CHECKPOINT
+            SET @Sec = DATEDIFF(SECOND, @Start, GETDATE())
+            SET @Rate = CASE WHEN @Sec > 0 THEN @Total / @Sec ELSE 0 END
+            PRINT '  batch ' + CAST(@Deleted AS VARCHAR) + ' | total ' + CAST(@Total AS VARCHAR) + ' | ' + CAST(@Sec AS VARCHAR) + 's | ~' + CAST(@Rate AS VARCHAR) + ' rows/sec'
+            IF @BatchDelay <> '00:00:00' WAITFOR DELAY @BatchDelay
+        END
+    END
+    PRINT '  Done: ' + CAST(@Total AS VARCHAR) + ' rows removed.'
+END
+PRINT ''
+
+-- 7. RawProcessGroup (ExportDate)
+IF OBJECT_ID('RawProcessGroup','U') IS NOT NULL
+BEGIN
+    PRINT 'Cleaning RawProcessGroup...'
+    SET @Total = 0  SET @Start = GETDATE()  SET @Deleted = 1
+    WHILE @Deleted > 0
+    BEGIN
+        DELETE TOP (@BatchSize) FROM RawProcessGroup WHERE ExportDate < @CutoffDate
+        SET @Deleted = @@ROWCOUNT
+        SET @Total = @Total + @Deleted
+        IF @Deleted > 0
+        BEGIN
+            CHECKPOINT
+            SET @Sec = DATEDIFF(SECOND, @Start, GETDATE())
+            SET @Rate = CASE WHEN @Sec > 0 THEN @Total / @Sec ELSE 0 END
+            PRINT '  batch ' + CAST(@Deleted AS VARCHAR) + ' | total ' + CAST(@Total AS VARCHAR) + ' | ' + CAST(@Sec AS VARCHAR) + 's | ~' + CAST(@Rate AS VARCHAR) + ' rows/sec'
+            IF @BatchDelay <> '00:00:00' WAITFOR DELAY @BatchDelay
+        END
+    END
+    PRINT '  Done: ' + CAST(@Total AS VARCHAR) + ' rows removed.'
+END
+PRINT ''
+
+-- 8. RawJobHistory (StartAt)
+IF OBJECT_ID('RawJobHistory','U') IS NOT NULL
+BEGIN
+    PRINT 'Cleaning RawJobHistory...'
+    SET @Total = 0  SET @Start = GETDATE()  SET @Deleted = 1
+    WHILE @Deleted > 0
+    BEGIN
+        DELETE TOP (@BatchSize) FROM RawJobHistory WHERE StartAt < @CutoffDate
+        SET @Deleted = @@ROWCOUNT
+        SET @Total = @Total + @Deleted
+        IF @Deleted > 0
+        BEGIN
+            CHECKPOINT
+            SET @Sec = DATEDIFF(SECOND, @Start, GETDATE())
+            SET @Rate = CASE WHEN @Sec > 0 THEN @Total / @Sec ELSE 0 END
+            PRINT '  batch ' + CAST(@Deleted AS VARCHAR) + ' | total ' + CAST(@Total AS VARCHAR) + ' | ' + CAST(@Sec AS VARCHAR) + 's | ~' + CAST(@Rate AS VARCHAR) + ' rows/sec'
+            IF @BatchDelay <> '00:00:00' WAITFOR DELAY @BatchDelay
+        END
+    END
+    PRINT '  Done: ' + CAST(@Total AS VARCHAR) + ' rows removed.'
+END
+PRINT ''
+
+-- 9. WatchProperty (FK join -> WatchOperation.OperationDate)
+IF OBJECT_ID('WatchProperty','U') IS NOT NULL
+AND OBJECT_ID('WatchOperation','U') IS NOT NULL
+BEGIN
+    PRINT 'Cleaning WatchProperty (via WatchOperation.OperationDate)...'
+    SET @Total = 0  SET @Start = GETDATE()  SET @Deleted = 1
+    WHILE @Deleted > 0
+    BEGIN
+        DELETE TOP (@BatchSize) child
+        FROM WatchProperty child
+        INNER JOIN WatchOperation parent
+            ON child.UID_DialogWatchOperation = parent.UID_DialogWatchOperation
+        WHERE parent.OperationDate < @CutoffDate
+        SET @Deleted = @@ROWCOUNT
+        SET @Total = @Total + @Deleted
+        IF @Deleted > 0
+        BEGIN
+            CHECKPOINT
+            SET @Sec = DATEDIFF(SECOND, @Start, GETDATE())
+            SET @Rate = CASE WHEN @Sec > 0 THEN @Total / @Sec ELSE 0 END
+            PRINT '  batch ' + CAST(@Deleted AS VARCHAR) + ' | total ' + CAST(@Total AS VARCHAR) + ' | ' + CAST(@Sec AS VARCHAR) + 's | ~' + CAST(@Rate AS VARCHAR) + ' rows/sec'
+            IF @BatchDelay <> '00:00:00' WAITFOR DELAY @BatchDelay
+        END
+    END
+    PRINT '  Done: ' + CAST(@Total AS VARCHAR) + ' rows removed.'
+END
+PRINT ''
+
+-- 10. WatchOperation (OperationDate)
+IF OBJECT_ID('WatchOperation','U') IS NOT NULL
+BEGIN
+    PRINT 'Cleaning WatchOperation...'
+    SET @Total = 0  SET @Start = GETDATE()  SET @Deleted = 1
+    WHILE @Deleted > 0
+    BEGIN
+        DELETE TOP (@BatchSize) FROM WatchOperation WHERE OperationDate < @CutoffDate
+        SET @Deleted = @@ROWCOUNT
+        SET @Total = @Total + @Deleted
+        IF @Deleted > 0
+        BEGIN
+            CHECKPOINT
+            SET @Sec = DATEDIFF(SECOND, @Start, GETDATE())
+            SET @Rate = CASE WHEN @Sec > 0 THEN @Total / @Sec ELSE 0 END
+            PRINT '  batch ' + CAST(@Deleted AS VARCHAR) + ' | total ' + CAST(@Total AS VARCHAR) + ' | ' + CAST(@Sec AS VARCHAR) + 's | ~' + CAST(@Rate AS VARCHAR) + ' rows/sec'
+            IF @BatchDelay <> '00:00:00' WAITFOR DELAY @BatchDelay
+        END
+    END
+    PRINT '  Done: ' + CAST(@Total AS VARCHAR) + ' rows removed.'
+END
+PRINT ''
+
+-- 11. ProcessStep (ThisDate)
+IF OBJECT_ID('ProcessStep','U') IS NOT NULL
+BEGIN
+    PRINT 'Cleaning ProcessStep...'
+    SET @Total = 0  SET @Start = GETDATE()  SET @Deleted = 1
+    WHILE @Deleted > 0
+    BEGIN
+        DELETE TOP (@BatchSize) FROM ProcessStep WHERE ThisDate < @CutoffDate
+        SET @Deleted = @@ROWCOUNT
+        SET @Total = @Total + @Deleted
+        IF @Deleted > 0
+        BEGIN
+            CHECKPOINT
+            SET @Sec = DATEDIFF(SECOND, @Start, GETDATE())
+            SET @Rate = CASE WHEN @Sec > 0 THEN @Total / @Sec ELSE 0 END
+            PRINT '  batch ' + CAST(@Deleted AS VARCHAR) + ' | total ' + CAST(@Total AS VARCHAR) + ' | ' + CAST(@Sec AS VARCHAR) + 's | ~' + CAST(@Rate AS VARCHAR) + ' rows/sec'
+            IF @BatchDelay <> '00:00:00' WAITFOR DELAY @BatchDelay
+        END
+    END
+    PRINT '  Done: ' + CAST(@Total AS VARCHAR) + ' rows removed.'
+END
+PRINT ''
+
+-- 12. ProcessSubstitute (FK join -> ProcessInfo.FirstDate)
+IF OBJECT_ID('ProcessSubstitute','U') IS NOT NULL
+AND OBJECT_ID('ProcessInfo','U') IS NOT NULL
+BEGIN
+    PRINT 'Cleaning ProcessSubstitute (via ProcessInfo.FirstDate)...'
+    SET @Total = 0  SET @Start = GETDATE()  SET @Deleted = 1
+    WHILE @Deleted > 0
+    BEGIN
+        DELETE TOP (@BatchSize) child
+        FROM ProcessSubstitute child
+        INNER JOIN ProcessInfo parent ON child.UID_ProcessInfoNew = parent.UID_ProcessInfo
+        WHERE parent.FirstDate < @CutoffDate
+        SET @Deleted = @@ROWCOUNT
+        SET @Total = @Total + @Deleted
+        IF @Deleted > 0
+        BEGIN
+            CHECKPOINT
+            SET @Sec = DATEDIFF(SECOND, @Start, GETDATE())
+            SET @Rate = CASE WHEN @Sec > 0 THEN @Total / @Sec ELSE 0 END
+            PRINT '  batch ' + CAST(@Deleted AS VARCHAR) + ' | total ' + CAST(@Total AS VARCHAR) + ' | ' + CAST(@Sec AS VARCHAR) + 's | ~' + CAST(@Rate AS VARCHAR) + ' rows/sec'
+            IF @BatchDelay <> '00:00:00' WAITFOR DELAY @BatchDelay
+        END
+    END
+    PRINT '  Done: ' + CAST(@Total AS VARCHAR) + ' rows removed.'
+END
+PRINT ''
+
+-- 13. ProcessChain (ThisDate)
+IF OBJECT_ID('ProcessChain','U') IS NOT NULL
+BEGIN
+    PRINT 'Cleaning ProcessChain...'
+    SET @Total = 0  SET @Start = GETDATE()  SET @Deleted = 1
+    WHILE @Deleted > 0
+    BEGIN
+        DELETE TOP (@BatchSize) FROM ProcessChain WHERE ThisDate < @CutoffDate
+        SET @Deleted = @@ROWCOUNT
+        SET @Total = @Total + @Deleted
+        IF @Deleted > 0
+        BEGIN
+            CHECKPOINT
+            SET @Sec = DATEDIFF(SECOND, @Start, GETDATE())
+            SET @Rate = CASE WHEN @Sec > 0 THEN @Total / @Sec ELSE 0 END
+            PRINT '  batch ' + CAST(@Deleted AS VARCHAR) + ' | total ' + CAST(@Total AS VARCHAR) + ' | ' + CAST(@Sec AS VARCHAR) + 's | ~' + CAST(@Rate AS VARCHAR) + ' rows/sec'
+            IF @BatchDelay <> '00:00:00' WAITFOR DELAY @BatchDelay
+        END
+    END
+    PRINT '  Done: ' + CAST(@Total AS VARCHAR) + ' rows removed.'
+END
+PRINT ''
+
+-- 14. HistoryJob (StartAt)
+IF OBJECT_ID('HistoryJob','U') IS NOT NULL
+BEGIN
+    PRINT 'Cleaning HistoryJob...'
+    SET @Total = 0  SET @Start = GETDATE()  SET @Deleted = 1
+    WHILE @Deleted > 0
+    BEGIN
+        DELETE TOP (@BatchSize) FROM HistoryJob WHERE StartAt < @CutoffDate
+        SET @Deleted = @@ROWCOUNT
+        SET @Total = @Total + @Deleted
+        IF @Deleted > 0
+        BEGIN
+            CHECKPOINT
+            SET @Sec = DATEDIFF(SECOND, @Start, GETDATE())
+            SET @Rate = CASE WHEN @Sec > 0 THEN @Total / @Sec ELSE 0 END
+            PRINT '  batch ' + CAST(@Deleted AS VARCHAR) + ' | total ' + CAST(@Total AS VARCHAR) + ' | ' + CAST(@Sec AS VARCHAR) + 's | ~' + CAST(@Rate AS VARCHAR) + ' rows/sec'
+            IF @BatchDelay <> '00:00:00' WAITFOR DELAY @BatchDelay
+        END
+    END
+    PRINT '  Done: ' + CAST(@Total AS VARCHAR) + ' rows removed.'
+END
+PRINT ''
+
+-- 15. HistoryChain (FirstDate)
+IF OBJECT_ID('HistoryChain','U') IS NOT NULL
+BEGIN
+    PRINT 'Cleaning HistoryChain...'
+    SET @Total = 0  SET @Start = GETDATE()  SET @Deleted = 1
+    WHILE @Deleted > 0
+    BEGIN
+        DELETE TOP (@BatchSize) FROM HistoryChain WHERE FirstDate < @CutoffDate
+        SET @Deleted = @@ROWCOUNT
+        SET @Total = @Total + @Deleted
+        IF @Deleted > 0
+        BEGIN
+            CHECKPOINT
+            SET @Sec = DATEDIFF(SECOND, @Start, GETDATE())
+            SET @Rate = CASE WHEN @Sec > 0 THEN @Total / @Sec ELSE 0 END
+            PRINT '  batch ' + CAST(@Deleted AS VARCHAR) + ' | total ' + CAST(@Total AS VARCHAR) + ' | ' + CAST(@Sec AS VARCHAR) + 's | ~' + CAST(@Rate AS VARCHAR) + ' rows/sec'
+            IF @BatchDelay <> '00:00:00' WAITFOR DELAY @BatchDelay
+        END
+    END
+    PRINT '  Done: ' + CAST(@Total AS VARCHAR) + ' rows removed.'
+END
+PRINT ''
+
+-- 16. ProcessInfo (FirstDate)
+IF OBJECT_ID('ProcessInfo','U') IS NOT NULL
+BEGIN
+    PRINT 'Cleaning ProcessInfo...'
+    SET @Total = 0  SET @Start = GETDATE()  SET @Deleted = 1
+    WHILE @Deleted > 0
+    BEGIN
+        DELETE TOP (@BatchSize) FROM ProcessInfo WHERE FirstDate < @CutoffDate
+        SET @Deleted = @@ROWCOUNT
+        SET @Total = @Total + @Deleted
+        IF @Deleted > 0
+        BEGIN
+            CHECKPOINT
+            SET @Sec = DATEDIFF(SECOND, @Start, GETDATE())
+            SET @Rate = CASE WHEN @Sec > 0 THEN @Total / @Sec ELSE 0 END
+            PRINT '  batch ' + CAST(@Deleted AS VARCHAR) + ' | total ' + CAST(@Total AS VARCHAR) + ' | ' + CAST(@Sec AS VARCHAR) + 's | ~' + CAST(@Rate AS VARCHAR) + ' rows/sec'
+            IF @BatchDelay <> '00:00:00' WAITFOR DELAY @BatchDelay
+        END
+    END
+    PRINT '  Done: ' + CAST(@Total AS VARCHAR) + ' rows removed.'
+END
+PRINT ''
+
+-- 17. ProcessGroup (FirstDate)
+IF OBJECT_ID('ProcessGroup','U') IS NOT NULL
+BEGIN
+    PRINT 'Cleaning ProcessGroup...'
+    SET @Total = 0  SET @Start = GETDATE()  SET @Deleted = 1
+    WHILE @Deleted > 0
+    BEGIN
+        DELETE TOP (@BatchSize) FROM ProcessGroup WHERE FirstDate < @CutoffDate
+        SET @Deleted = @@ROWCOUNT
+        SET @Total = @Total + @Deleted
+        IF @Deleted > 0
+        BEGIN
+            CHECKPOINT
+            SET @Sec = DATEDIFF(SECOND, @Start, GETDATE())
+            SET @Rate = CASE WHEN @Sec > 0 THEN @Total / @Sec ELSE 0 END
+            PRINT '  batch ' + CAST(@Deleted AS VARCHAR) + ' | total ' + CAST(@Total AS VARCHAR) + ' | ' + CAST(@Sec AS VARCHAR) + 's | ~' + CAST(@Rate AS VARCHAR) + ' rows/sec'
+            IF @BatchDelay <> '00:00:00' WAITFOR DELAY @BatchDelay
+        END
+    END
+    PRINT '  Done: ' + CAST(@Total AS VARCHAR) + ' rows removed.'
 END
 
 -- ============================================================
@@ -693,80 +537,43 @@ END
 -- ============================================================
 PRINT ''
 PRINT '================================================'
-PRINT '# POST-CLEANUP SUMMARY'
-PRINT '================================================'
+PRINT '# POST-CLEANUP (estimated row counts)'
+PRINT '------------------------------------------------'
 
+DECLARE @PostTbl NVARCHAR(128)
+DECLARE @PostCnt BIGINT
 DECLARE post_cur CURSOR LOCAL FAST_FORWARD FOR
-    SELECT TableName FROM @Tables ORDER BY TableName
+    SELECT name FROM sys.tables
+    WHERE name IN (
+        'RawWatchProperty','RawWatchOperation','RawProcessStep',
+        'RawProcessSubstitute','RawProcessChain','RawProcess',
+        'RawProcessGroup','RawJobHistory',
+        'WatchProperty','WatchOperation','ProcessStep',
+        'ProcessSubstitute','ProcessChain','HistoryJob',
+        'HistoryChain','ProcessInfo','ProcessGroup'
+    )
+    ORDER BY name
 
 OPEN post_cur
-FETCH NEXT FROM post_cur INTO @TableName
+FETCH NEXT FROM post_cur INTO @PostTbl
 WHILE @@FETCH_STATUS = 0
 BEGIN
-    SET @SQL = N'SELECT @cnt = SUM(p.row_count) FROM sys.dm_db_partition_stats p WHERE p.object_id = OBJECT_ID(''' + @TableName + N''') AND p.index_id IN (0,1)'
-    EXEC sp_executesql @SQL, N'@cnt BIGINT OUTPUT', @RowCount OUTPUT
-    PRINT '  ' + @TableName + ': ~' + CAST(ISNULL(@RowCount, 0) AS VARCHAR) + ' rows remaining'
-    FETCH NEXT FROM post_cur INTO @TableName
+    SELECT @PostCnt = SUM(p.row_count)
+    FROM sys.dm_db_partition_stats p
+    WHERE p.object_id = OBJECT_ID(@PostTbl) AND p.index_id IN (0,1)
+
+    PRINT '  ' + @PostTbl + ': ~' + CAST(ISNULL(@PostCnt,0) AS VARCHAR) + ' rows'
+    FETCH NEXT FROM post_cur INTO @PostTbl
 END
 CLOSE post_cur
 DEALLOCATE post_cur
 
--- Also show FK-joined tables
-DECLARE fk_post CURSOR LOCAL FAST_FORWARD FOR
-    SELECT ChildTable FROM @FKJoinDeletes ORDER BY ChildTable
-
-OPEN fk_post
-FETCH NEXT FROM fk_post INTO @FKChild
-WHILE @@FETCH_STATUS = 0
-BEGIN
-    IF OBJECT_ID(@FKChild, 'U') IS NOT NULL
-    BEGIN
-        SET @SQL = N'SELECT @cnt = SUM(p.row_count) FROM sys.dm_db_partition_stats p WHERE p.object_id = OBJECT_ID(''' + @FKChild + N''') AND p.index_id IN (0,1)'
-        EXEC sp_executesql @SQL, N'@cnt BIGINT OUTPUT', @RowCount OUTPUT
-        PRINT '  ' + @FKChild + ': ~' + CAST(ISNULL(@RowCount, 0) AS VARCHAR) + ' rows remaining (FK-joined)'
-    END
-    FETCH NEXT FROM fk_post INTO @FKChild
-END
-CLOSE fk_post
-DEALLOCATE fk_post
-
--- ============================================================
--- DROP TEMP INDEXES
--- ============================================================
-DECLARE @DropIdx NVARCHAR(256)
-DECLARE @DropTbl NVARCHAR(256)
-DECLARE drop_cur CURSOR LOCAL FAST_FORWARD FOR
-    SELECT IndexName, TableName FROM @TempIndexes
-OPEN drop_cur
-FETCH NEXT FROM drop_cur INTO @DropIdx, @DropTbl
-WHILE @@FETCH_STATUS = 0
-BEGIN
-    BEGIN TRY
-        SET @SQL = N'DROP INDEX [' + @DropIdx + N'] ON [' + @DropTbl + N']'
-        EXEC sp_executesql @SQL
-        PRINT '  Dropped temp index ' + @DropIdx
-    END TRY
-    BEGIN CATCH
-        PRINT '  WARN Could not drop ' + @DropIdx + ': ' + ERROR_MESSAGE()
-    END CATCH
-    FETCH NEXT FROM drop_cur INTO @DropIdx, @DropTbl
-END
-CLOSE drop_cur
-DEALLOCATE drop_cur
-
-PRINT ''
-PRINT '================================================'
-PRINT 'Cleanup complete.'
 PRINT ''
 PRINT 'Recommended post-cleanup steps:'
-PRINT '  1. Update statistics on cleaned tables:'
-PRINT '     EXEC sp_updatestats'
-PRINT ''
-PRINT '  2. Rebuild indexes to reduce fragmentation'
-PRINT '     (run during a maintenance window):'
-PRINT '     EXEC sp_MSforeachtable ''ALTER INDEX ALL ON ? REBUILD'''
-PRINT ''
-PRINT '  3. If using FULL recovery model, back up the'
-PRINT '     transaction log to reclaim log space.'
+PRINT '  1. EXEC sp_updatestats'
+PRINT '  2. ALTER INDEX ALL ON <table> REBUILD (maintenance window)'
+PRINT '  3. Back up transaction log if using FULL recovery model'
+PRINT '================================================'
+PRINT 'Cleanup complete.'
 PRINT '================================================'
 GO
