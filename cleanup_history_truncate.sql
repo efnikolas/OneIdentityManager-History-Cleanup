@@ -122,7 +122,7 @@ BEGIN
     DELETE TOP (@BatchSize) ps
     FROM ProcessSubstitute ps
     INNER JOIN ProcessInfo pi ON ps.UID_ProcessInfoNew = pi.UID_ProcessInfo
-    WHERE pi.FirstDate < @CutoffDate
+    WHERE COALESCE(pi.FirstDate, pi.LastDate) < @CutoffDate
     SET @rc = @@ROWCOUNT
     SET @total = @total + @rc
     IF @rc > 0
@@ -164,7 +164,7 @@ RAISERROR('HistoryChain...', 0, 1) WITH NOWAIT
 SET @total = 0; SET @st = GETDATE(); SET @rc = 1
 WHILE @rc > 0
 BEGIN
-    DELETE TOP (@BatchSize) FROM HistoryChain WHERE FirstDate < @CutoffDate
+    DELETE TOP (@BatchSize) FROM HistoryChain WHERE COALESCE(FirstDate, LastDate) < @CutoffDate
     SET @rc = @@ROWCOUNT
     SET @total = @total + @rc
     IF @rc > 0
@@ -178,7 +178,7 @@ RAISERROR('ProcessInfo...', 0, 1) WITH NOWAIT
 SET @total = 0; SET @st = GETDATE(); SET @rc = 1
 WHILE @rc > 0
 BEGIN
-    DELETE TOP (@BatchSize) FROM ProcessInfo WHERE FirstDate < @CutoffDate
+    DELETE TOP (@BatchSize) FROM ProcessInfo WHERE COALESCE(FirstDate, LastDate) < @CutoffDate
     SET @rc = @@ROWCOUNT
     SET @total = @total + @rc
     IF @rc > 0
@@ -192,7 +192,7 @@ RAISERROR('ProcessGroup...', 0, 1) WITH NOWAIT
 SET @total = 0; SET @st = GETDATE(); SET @rc = 1
 WHILE @rc > 0
 BEGIN
-    DELETE TOP (@BatchSize) FROM ProcessGroup WHERE FirstDate < @CutoffDate
+    DELETE TOP (@BatchSize) FROM ProcessGroup WHERE COALESCE(FirstDate, LastDate, ExportDate) < @CutoffDate
     SET @rc = @@ROWCOUNT
     SET @total = @total + @rc
     IF @rc > 0
