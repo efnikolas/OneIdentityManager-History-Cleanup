@@ -118,10 +118,10 @@ PRINT '================================================'
 --  11. ProcessStep          (ThisDate)
 --  12. ProcessSubstitute    (FK join -> ProcessInfo)
 --  13. ProcessChain         (ThisDate)
---  14. HistoryJob           (StartAt)
---  15. HistoryChain         (FirstDate)
---  16. ProcessInfo          (FirstDate)
---  17. ProcessGroup         (FirstDate)
+--  14. HistoryJob           (COALESCE(StartAt, ReadyAt))
+--  15. HistoryChain         (COALESCE(FirstDate, LastDate))
+--  16. ProcessInfo          (COALESCE(FirstDate, LastDate))
+--  17. ProcessGroup         (COALESCE(FirstDate, LastDate))
 -- ============================================================
 
 -- 1. RawWatchProperty (FK join -> RawWatchOperation.OperationDate)
@@ -391,7 +391,7 @@ BEGIN
 END
 PRINT ''
 
--- 12. ProcessSubstitute (FK join -> ProcessInfo.FirstDate)
+-- 12. ProcessSubstitute (FK join -> ProcessInfo, COALESCE(FirstDate, LastDate))
 IF OBJECT_ID('ProcessSubstitute','U') IS NOT NULL
 AND OBJECT_ID('ProcessInfo','U') IS NOT NULL
 BEGIN
@@ -402,7 +402,7 @@ BEGIN
         DELETE TOP (@BatchSize) child
         FROM ProcessSubstitute child
         INNER JOIN ProcessInfo parent ON child.UID_ProcessInfoNew = parent.UID_ProcessInfo
-        WHERE parent.FirstDate < @CutoffDate
+        WHERE COALESCE(parent.FirstDate, parent.LastDate) < @CutoffDate
         SET @Deleted = @@ROWCOUNT
         SET @Total = @Total + @Deleted
         IF @Deleted > 0
@@ -441,14 +441,14 @@ BEGIN
 END
 PRINT ''
 
--- 14. HistoryJob (StartAt)
+-- 14. HistoryJob (COALESCE(StartAt, ReadyAt))
 IF OBJECT_ID('HistoryJob','U') IS NOT NULL
 BEGIN
     PRINT 'Cleaning HistoryJob...'
     SET @Total = 0  SET @Start = GETDATE()  SET @Deleted = 1
     WHILE @Deleted > 0
     BEGIN
-        DELETE TOP (@BatchSize) FROM HistoryJob WHERE StartAt < @CutoffDate
+        DELETE TOP (@BatchSize) FROM HistoryJob WHERE COALESCE(StartAt, ReadyAt) < @CutoffDate
         SET @Deleted = @@ROWCOUNT
         SET @Total = @Total + @Deleted
         IF @Deleted > 0
@@ -464,14 +464,14 @@ BEGIN
 END
 PRINT ''
 
--- 15. HistoryChain (FirstDate)
+-- 15. HistoryChain (COALESCE(FirstDate, LastDate))
 IF OBJECT_ID('HistoryChain','U') IS NOT NULL
 BEGIN
     PRINT 'Cleaning HistoryChain...'
     SET @Total = 0  SET @Start = GETDATE()  SET @Deleted = 1
     WHILE @Deleted > 0
     BEGIN
-        DELETE TOP (@BatchSize) FROM HistoryChain WHERE FirstDate < @CutoffDate
+        DELETE TOP (@BatchSize) FROM HistoryChain WHERE COALESCE(FirstDate, LastDate) < @CutoffDate
         SET @Deleted = @@ROWCOUNT
         SET @Total = @Total + @Deleted
         IF @Deleted > 0
@@ -487,14 +487,14 @@ BEGIN
 END
 PRINT ''
 
--- 16. ProcessInfo (FirstDate)
+-- 16. ProcessInfo (COALESCE(FirstDate, LastDate))
 IF OBJECT_ID('ProcessInfo','U') IS NOT NULL
 BEGIN
     PRINT 'Cleaning ProcessInfo...'
     SET @Total = 0  SET @Start = GETDATE()  SET @Deleted = 1
     WHILE @Deleted > 0
     BEGIN
-        DELETE TOP (@BatchSize) FROM ProcessInfo WHERE FirstDate < @CutoffDate
+        DELETE TOP (@BatchSize) FROM ProcessInfo WHERE COALESCE(FirstDate, LastDate) < @CutoffDate
         SET @Deleted = @@ROWCOUNT
         SET @Total = @Total + @Deleted
         IF @Deleted > 0
@@ -510,14 +510,14 @@ BEGIN
 END
 PRINT ''
 
--- 17. ProcessGroup (FirstDate)
+-- 17. ProcessGroup (COALESCE(FirstDate, LastDate))
 IF OBJECT_ID('ProcessGroup','U') IS NOT NULL
 BEGIN
     PRINT 'Cleaning ProcessGroup...'
     SET @Total = 0  SET @Start = GETDATE()  SET @Deleted = 1
     WHILE @Deleted > 0
     BEGIN
-        DELETE TOP (@BatchSize) FROM ProcessGroup WHERE FirstDate < @CutoffDate
+        DELETE TOP (@BatchSize) FROM ProcessGroup WHERE COALESCE(FirstDate, LastDate) < @CutoffDate
         SET @Deleted = @@ROWCOUNT
         SET @Total = @Total + @Deleted
         IF @Deleted > 0

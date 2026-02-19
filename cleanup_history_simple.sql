@@ -166,7 +166,7 @@ BEGIN
         FROM WatchProperty child
         INNER JOIN WatchOperation parent
             ON child.UID_DialogWatchOperation = parent.UID_DialogWatchOperation
-        WHERE parent.OperationDate < @CutoffDate
+        WHERE parent.OperationDate < @CutoffDate OR parent.OperationDate IS NULL
         SET @d = @@ROWCOUNT; SET @tot += @d
         IF @d > 0 BEGIN CHECKPOINT; SET @sec = DATEDIFF(SECOND, @st, GETDATE()); SET @rate = CASE WHEN @sec > 0 THEN @tot / @sec ELSE 0 END
             RAISERROR('  %I64d deleted | %ds | ~%I64d rows/sec', 0, 1, @tot, @sec, @rate) WITH NOWAIT
@@ -184,7 +184,7 @@ BEGIN
     SET @d = 1; SET @tot = 0; SET @st = GETDATE()
     WHILE @d > 0
     BEGIN
-        DELETE TOP (@BatchSize) FROM WatchOperation WHERE OperationDate < @CutoffDate
+        DELETE TOP (@BatchSize) FROM WatchOperation WHERE OperationDate < @CutoffDate OR OperationDate IS NULL
         SET @d = @@ROWCOUNT; SET @tot += @d
         IF @d > 0 BEGIN CHECKPOINT; SET @sec = DATEDIFF(SECOND, @st, GETDATE()); SET @rate = CASE WHEN @sec > 0 THEN @tot / @sec ELSE 0 END
             RAISERROR('  %I64d deleted | %ds | ~%I64d rows/sec', 0, 1, @tot, @sec, @rate) WITH NOWAIT
@@ -202,7 +202,7 @@ BEGIN
     SET @d = 1; SET @tot = 0; SET @st = GETDATE()
     WHILE @d > 0
     BEGIN
-        DELETE TOP (@BatchSize) FROM ProcessStep WHERE ThisDate < @CutoffDate
+        DELETE TOP (@BatchSize) FROM ProcessStep WHERE ThisDate < @CutoffDate OR ThisDate IS NULL
         SET @d = @@ROWCOUNT; SET @tot += @d
         IF @d > 0 BEGIN CHECKPOINT; SET @sec = DATEDIFF(SECOND, @st, GETDATE()); SET @rate = CASE WHEN @sec > 0 THEN @tot / @sec ELSE 0 END
             RAISERROR('  %I64d deleted | %ds | ~%I64d rows/sec', 0, 1, @tot, @sec, @rate) WITH NOWAIT
@@ -212,7 +212,7 @@ BEGIN
 END
 
 -- ────────────────────────────────────────────────────────────
--- 4. ProcessSubstitute  (FK join → ProcessInfo.FirstDate)
+-- 4. ProcessSubstitute  (FK join → ProcessInfo, COALESCE(FirstDate, LastDate))
 -- ────────────────────────────────────────────────────────────
 IF OBJECT_ID('ProcessSubstitute', 'U') IS NOT NULL
 BEGIN
@@ -223,7 +223,8 @@ BEGIN
         DELETE TOP (@BatchSize) child
         FROM ProcessSubstitute child
         INNER JOIN ProcessInfo parent ON child.UID_ProcessInfoNew = parent.UID_ProcessInfo
-        WHERE parent.FirstDate < @CutoffDate
+        WHERE COALESCE(parent.FirstDate, parent.LastDate) < @CutoffDate
+              OR (parent.FirstDate IS NULL AND parent.LastDate IS NULL)
         SET @d = @@ROWCOUNT; SET @tot += @d
         IF @d > 0 BEGIN CHECKPOINT; SET @sec = DATEDIFF(SECOND, @st, GETDATE()); SET @rate = CASE WHEN @sec > 0 THEN @tot / @sec ELSE 0 END
             RAISERROR('  %I64d deleted | %ds | ~%I64d rows/sec', 0, 1, @tot, @sec, @rate) WITH NOWAIT
@@ -241,7 +242,7 @@ BEGIN
     SET @d = 1; SET @tot = 0; SET @st = GETDATE()
     WHILE @d > 0
     BEGIN
-        DELETE TOP (@BatchSize) FROM ProcessChain WHERE ThisDate < @CutoffDate
+        DELETE TOP (@BatchSize) FROM ProcessChain WHERE ThisDate < @CutoffDate OR ThisDate IS NULL
         SET @d = @@ROWCOUNT; SET @tot += @d
         IF @d > 0 BEGIN CHECKPOINT; SET @sec = DATEDIFF(SECOND, @st, GETDATE()); SET @rate = CASE WHEN @sec > 0 THEN @tot / @sec ELSE 0 END
             RAISERROR('  %I64d deleted | %ds | ~%I64d rows/sec', 0, 1, @tot, @sec, @rate) WITH NOWAIT
@@ -251,7 +252,7 @@ BEGIN
 END
 
 -- ────────────────────────────────────────────────────────────
--- 6. HistoryJob  (StartAt)
+-- 6. HistoryJob  (COALESCE(StartAt, ReadyAt))
 -- ────────────────────────────────────────────────────────────
 IF OBJECT_ID('HistoryJob', 'U') IS NOT NULL
 BEGIN
@@ -259,7 +260,9 @@ BEGIN
     SET @d = 1; SET @tot = 0; SET @st = GETDATE()
     WHILE @d > 0
     BEGIN
-        DELETE TOP (@BatchSize) FROM HistoryJob WHERE StartAt < @CutoffDate
+        DELETE TOP (@BatchSize) FROM HistoryJob
+        WHERE COALESCE(StartAt, ReadyAt) < @CutoffDate
+              OR (StartAt IS NULL AND ReadyAt IS NULL)
         SET @d = @@ROWCOUNT; SET @tot += @d
         IF @d > 0 BEGIN CHECKPOINT; SET @sec = DATEDIFF(SECOND, @st, GETDATE()); SET @rate = CASE WHEN @sec > 0 THEN @tot / @sec ELSE 0 END
             RAISERROR('  %I64d deleted | %ds | ~%I64d rows/sec', 0, 1, @tot, @sec, @rate) WITH NOWAIT
@@ -269,7 +272,8 @@ BEGIN
 END
 
 -- ────────────────────────────────────────────────────────────
--- 7. HistoryChain  (FirstDate)
+-- 7. HistoryChain  (COALESCE(FirstDate, LastDate))
+--    FirstDate is often NULL; LastDate is reliably populated
 -- ────────────────────────────────────────────────────────────
 IF OBJECT_ID('HistoryChain', 'U') IS NOT NULL
 BEGIN
@@ -277,7 +281,9 @@ BEGIN
     SET @d = 1; SET @tot = 0; SET @st = GETDATE()
     WHILE @d > 0
     BEGIN
-        DELETE TOP (@BatchSize) FROM HistoryChain WHERE FirstDate < @CutoffDate
+        DELETE TOP (@BatchSize) FROM HistoryChain
+        WHERE COALESCE(FirstDate, LastDate) < @CutoffDate
+              OR (FirstDate IS NULL AND LastDate IS NULL)
         SET @d = @@ROWCOUNT; SET @tot += @d
         IF @d > 0 BEGIN CHECKPOINT; SET @sec = DATEDIFF(SECOND, @st, GETDATE()); SET @rate = CASE WHEN @sec > 0 THEN @tot / @sec ELSE 0 END
             RAISERROR('  %I64d deleted | %ds | ~%I64d rows/sec', 0, 1, @tot, @sec, @rate) WITH NOWAIT
@@ -287,7 +293,8 @@ BEGIN
 END
 
 -- ────────────────────────────────────────────────────────────
--- 8. ProcessInfo  (FirstDate)
+-- 8. ProcessInfo  (COALESCE(FirstDate, LastDate))
+--    FirstDate is often NULL; LastDate is reliably populated
 -- ────────────────────────────────────────────────────────────
 IF OBJECT_ID('ProcessInfo', 'U') IS NOT NULL
 BEGIN
@@ -295,7 +302,9 @@ BEGIN
     SET @d = 1; SET @tot = 0; SET @st = GETDATE()
     WHILE @d > 0
     BEGIN
-        DELETE TOP (@BatchSize) FROM ProcessInfo WHERE FirstDate < @CutoffDate
+        DELETE TOP (@BatchSize) FROM ProcessInfo
+        WHERE COALESCE(FirstDate, LastDate) < @CutoffDate
+              OR (FirstDate IS NULL AND LastDate IS NULL)
         SET @d = @@ROWCOUNT; SET @tot += @d
         IF @d > 0 BEGIN CHECKPOINT; SET @sec = DATEDIFF(SECOND, @st, GETDATE()); SET @rate = CASE WHEN @sec > 0 THEN @tot / @sec ELSE 0 END
             RAISERROR('  %I64d deleted | %ds | ~%I64d rows/sec', 0, 1, @tot, @sec, @rate) WITH NOWAIT
@@ -305,7 +314,8 @@ BEGIN
 END
 
 -- ────────────────────────────────────────────────────────────
--- 9. ProcessGroup  (FirstDate)
+-- 9. ProcessGroup  (COALESCE(FirstDate, LastDate))
+--    FirstDate is often NULL; LastDate is reliably populated
 -- ────────────────────────────────────────────────────────────
 IF OBJECT_ID('ProcessGroup', 'U') IS NOT NULL
 BEGIN
@@ -313,7 +323,9 @@ BEGIN
     SET @d = 1; SET @tot = 0; SET @st = GETDATE()
     WHILE @d > 0
     BEGIN
-        DELETE TOP (@BatchSize) FROM ProcessGroup WHERE FirstDate < @CutoffDate
+        DELETE TOP (@BatchSize) FROM ProcessGroup
+        WHERE COALESCE(FirstDate, LastDate) < @CutoffDate
+              OR (FirstDate IS NULL AND LastDate IS NULL)
         SET @d = @@ROWCOUNT; SET @tot += @d
         IF @d > 0 BEGIN CHECKPOINT; SET @sec = DATEDIFF(SECOND, @st, GETDATE()); SET @rate = CASE WHEN @sec > 0 THEN @tot / @sec ELSE 0 END
             RAISERROR('  %I64d deleted | %ds | ~%I64d rows/sec', 0, 1, @tot, @sec, @rate) WITH NOWAIT

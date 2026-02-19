@@ -70,8 +70,12 @@ OPEN tbl_cur
 FETCH NEXT FROM tbl_cur INTO @TableName
 WHILE @@FETCH_STATUS = 0
 BEGIN
-    -- Find best date column
+    -- Find best date column (with COALESCE fallback for NULL-prone columns)
     SET @DateCol = NULL
+    
+    -- Check if table has both a primary date col AND a LastDate/EndAt fallback
+    DECLARE @FallbackCol NVARCHAR(256) = NULL
+    
     SELECT TOP 1 @DateCol = c.name
     FROM sys.columns c
     INNER JOIN sys.types ty ON c.user_type_id = ty.user_type_id
@@ -90,15 +94,30 @@ BEGIN
         END,
         c.column_id
 
+    -- Find fallback date column (LastDate or EndAt)
+    SELECT TOP 1 @FallbackCol = c.name
+    FROM sys.columns c
+    INNER JOIN sys.types ty ON c.user_type_id = ty.user_type_id
+    WHERE c.object_id = OBJECT_ID(@TableName)
+      AND ty.name IN ('datetime', 'datetime2', 'smalldatetime', 'date')
+      AND c.name IN ('LastDate', 'EndAt')
+    ORDER BY CASE c.name WHEN 'LastDate' THEN 1 WHEN 'EndAt' THEN 2 ELSE 3 END
+
     IF @DateCol IS NOT NULL
     BEGIN
+        DECLARE @DateExpr NVARCHAR(512)
+        IF @FallbackCol IS NOT NULL AND @FallbackCol <> @DateCol
+            SET @DateExpr = N'COALESCE([' + @DateCol + N'], [' + @FallbackCol + N'])'
+        ELSE
+            SET @DateExpr = N'[' + @DateCol + N']'
+
         SET @SQL = N'
             SELECT
-                @oldest  = MIN([' + @DateCol + N']),
-                @newest  = MAX([' + @DateCol + N']),
+                @oldest  = MIN(' + @DateExpr + N'),
+                @newest  = MAX(' + @DateExpr + N'),
                 @total   = COUNT(*),
-                @purge   = SUM(CASE WHEN [' + @DateCol + N'] < @cutoff THEN 1 ELSE 0 END),
-                @keep    = SUM(CASE WHEN [' + @DateCol + N'] >= @cutoff THEN 1 ELSE 0 END)
+                @purge   = SUM(CASE WHEN ' + @DateExpr + N' < @cutoff THEN 1 ELSE 0 END),
+                @keep    = SUM(CASE WHEN ' + @DateExpr + N' >= @cutoff THEN 1 ELSE 0 END)
             FROM [' + @TableName + N']'
 
         EXEC sp_executesql @SQL,
