@@ -4,7 +4,10 @@
 -- Deletes data older than @CutoffDate from all HDB tables.
 -- Schema is hardcoded per OIM 9.x Data Archiving docs.
 --
--- Tables:  20 total (17 data + 3 metadata we skip)
+-- Tables:  20 total in HDB schema
+--   - 8 Raw* tables: staging/inbox, auto-cleaned after processing (SKIPPED)
+--   - 3 metadata tables: SourceColumn/Database/Table (SKIPPED)
+--   - 9 aggregated tables: the actual data we clean up
 -- Order:   Children first, parents last (FK-safe)
 --
 -- ⚠️  BACKUP YOUR DATABASE BEFORE RUNNING THIS SCRIPT
@@ -37,9 +40,6 @@ DECLARE @est BIGINT
 DECLARE @tbl NVARCHAR(128)
 DECLARE @preflight TABLE (TableName NVARCHAR(128))
 INSERT @preflight VALUES
-  ('RawWatchProperty'),('RawWatchOperation'),('RawProcessStep'),
-  ('RawProcessSubstitute'),('RawProcessChain'),('RawProcess'),
-  ('RawProcessGroup'),('RawJobHistory'),
   ('WatchProperty'),('WatchOperation'),('ProcessStep'),
   ('ProcessSubstitute'),('ProcessChain'),('HistoryJob'),
   ('HistoryChain'),('ProcessInfo'),('ProcessGroup')
@@ -88,161 +88,7 @@ PRINT '# CLEANUP'
 PRINT '================================================'
 
 -- ────────────────────────────────────────────────────────────
--- 1. RawWatchProperty  (FK join → RawWatchOperation.OperationDate)
--- ────────────────────────────────────────────────────────────
-IF OBJECT_ID('RawWatchProperty', 'U') IS NOT NULL
-BEGIN
-    PRINT 'Cleaning RawWatchProperty (via RawWatchOperation)...'
-    SET @d = 1; SET @tot = 0; SET @st = GETDATE()
-    WHILE @d > 0
-    BEGIN
-        DELETE TOP (@BatchSize) child
-        FROM RawWatchProperty child
-        INNER JOIN RawWatchOperation parent
-            ON child.UID_DialogWatchOperation = parent.UID_DialogWatchOperation
-        WHERE parent.OperationDate < @CutoffDate
-        SET @d = @@ROWCOUNT; SET @tot += @d
-        IF @d > 0 BEGIN
-            CHECKPOINT
-            SET @sec = DATEDIFF(SECOND, @st, GETDATE())
-            SET @rate = CASE WHEN @sec > 0 THEN @tot / @sec ELSE 0 END
-            PRINT '  ' + CAST(@tot AS VARCHAR) + ' deleted | ' + CAST(@sec AS VARCHAR) + 's | ~' + CAST(@rate AS VARCHAR) + ' rows/sec'
-        END
-    END
-    PRINT '  Done: ' + CAST(@tot AS VARCHAR) + ' rows removed.'
-END
-
--- ────────────────────────────────────────────────────────────
--- 2. RawWatchOperation  (OperationDate)
--- ────────────────────────────────────────────────────────────
-IF OBJECT_ID('RawWatchOperation', 'U') IS NOT NULL
-BEGIN
-    PRINT 'Cleaning RawWatchOperation...'
-    SET @d = 1; SET @tot = 0; SET @st = GETDATE()
-    WHILE @d > 0
-    BEGIN
-        DELETE TOP (@BatchSize) FROM RawWatchOperation WHERE OperationDate < @CutoffDate
-        SET @d = @@ROWCOUNT; SET @tot += @d
-        IF @d > 0 BEGIN CHECKPOINT; SET @sec = DATEDIFF(SECOND, @st, GETDATE()); SET @rate = CASE WHEN @sec > 0 THEN @tot / @sec ELSE 0 END
-            PRINT '  ' + CAST(@tot AS VARCHAR) + ' deleted | ' + CAST(@sec AS VARCHAR) + 's | ~' + CAST(@rate AS VARCHAR) + ' rows/sec'
-        END
-    END
-    PRINT '  Done: ' + CAST(@tot AS VARCHAR) + ' rows removed.'
-END
-
--- ────────────────────────────────────────────────────────────
--- 3. RawProcessStep  (XDateInserted)
--- ────────────────────────────────────────────────────────────
-IF OBJECT_ID('RawProcessStep', 'U') IS NOT NULL
-BEGIN
-    PRINT 'Cleaning RawProcessStep...'
-    SET @d = 1; SET @tot = 0; SET @st = GETDATE()
-    WHILE @d > 0
-    BEGIN
-        DELETE TOP (@BatchSize) FROM RawProcessStep WHERE XDateInserted < @CutoffDate
-        SET @d = @@ROWCOUNT; SET @tot += @d
-        IF @d > 0 BEGIN CHECKPOINT; SET @sec = DATEDIFF(SECOND, @st, GETDATE()); SET @rate = CASE WHEN @sec > 0 THEN @tot / @sec ELSE 0 END
-            PRINT '  ' + CAST(@tot AS VARCHAR) + ' deleted | ' + CAST(@sec AS VARCHAR) + 's | ~' + CAST(@rate AS VARCHAR) + ' rows/sec'
-        END
-    END
-    PRINT '  Done: ' + CAST(@tot AS VARCHAR) + ' rows removed.'
-END
-
--- ────────────────────────────────────────────────────────────
--- 4. RawProcessSubstitute  (FK join → RawProcess.XDateInserted)
--- ────────────────────────────────────────────────────────────
-IF OBJECT_ID('RawProcessSubstitute', 'U') IS NOT NULL
-BEGIN
-    PRINT 'Cleaning RawProcessSubstitute (via RawProcess)...'
-    SET @d = 1; SET @tot = 0; SET @st = GETDATE()
-    WHILE @d > 0
-    BEGIN
-        DELETE TOP (@BatchSize) child
-        FROM RawProcessSubstitute child
-        INNER JOIN RawProcess parent ON child.GenProcIDNew = parent.GenProcID
-        WHERE parent.XDateInserted < @CutoffDate
-        SET @d = @@ROWCOUNT; SET @tot += @d
-        IF @d > 0 BEGIN CHECKPOINT; SET @sec = DATEDIFF(SECOND, @st, GETDATE()); SET @rate = CASE WHEN @sec > 0 THEN @tot / @sec ELSE 0 END
-            PRINT '  ' + CAST(@tot AS VARCHAR) + ' deleted | ' + CAST(@sec AS VARCHAR) + 's | ~' + CAST(@rate AS VARCHAR) + ' rows/sec'
-        END
-    END
-    PRINT '  Done: ' + CAST(@tot AS VARCHAR) + ' rows removed.'
-END
-
--- ────────────────────────────────────────────────────────────
--- 5. RawJobHistory  (XDateInserted)  — FK → RawProcess
--- ────────────────────────────────────────────────────────────
-IF OBJECT_ID('RawJobHistory', 'U') IS NOT NULL
-BEGIN
-    PRINT 'Cleaning RawJobHistory...'
-    SET @d = 1; SET @tot = 0; SET @st = GETDATE()
-    WHILE @d > 0
-    BEGIN
-        DELETE TOP (@BatchSize) FROM RawJobHistory WHERE XDateInserted < @CutoffDate
-        SET @d = @@ROWCOUNT; SET @tot += @d
-        IF @d > 0 BEGIN CHECKPOINT; SET @sec = DATEDIFF(SECOND, @st, GETDATE()); SET @rate = CASE WHEN @sec > 0 THEN @tot / @sec ELSE 0 END
-            PRINT '  ' + CAST(@tot AS VARCHAR) + ' deleted | ' + CAST(@sec AS VARCHAR) + 's | ~' + CAST(@rate AS VARCHAR) + ' rows/sec'
-        END
-    END
-    PRINT '  Done: ' + CAST(@tot AS VARCHAR) + ' rows removed.'
-END
-
--- ────────────────────────────────────────────────────────────
--- 6. RawProcessChain  (XDateInserted)  — FK → RawProcess
--- ────────────────────────────────────────────────────────────
-IF OBJECT_ID('RawProcessChain', 'U') IS NOT NULL
-BEGIN
-    PRINT 'Cleaning RawProcessChain...'
-    SET @d = 1; SET @tot = 0; SET @st = GETDATE()
-    WHILE @d > 0
-    BEGIN
-        DELETE TOP (@BatchSize) FROM RawProcessChain WHERE XDateInserted < @CutoffDate
-        SET @d = @@ROWCOUNT; SET @tot += @d
-        IF @d > 0 BEGIN CHECKPOINT; SET @sec = DATEDIFF(SECOND, @st, GETDATE()); SET @rate = CASE WHEN @sec > 0 THEN @tot / @sec ELSE 0 END
-            PRINT '  ' + CAST(@tot AS VARCHAR) + ' deleted | ' + CAST(@sec AS VARCHAR) + 's | ~' + CAST(@rate AS VARCHAR) + ' rows/sec'
-        END
-    END
-    PRINT '  Done: ' + CAST(@tot AS VARCHAR) + ' rows removed.'
-END
-
--- ────────────────────────────────────────────────────────────
--- 7. RawProcess  (XDateInserted)
--- ────────────────────────────────────────────────────────────
-IF OBJECT_ID('RawProcess', 'U') IS NOT NULL
-BEGIN
-    PRINT 'Cleaning RawProcess...'
-    SET @d = 1; SET @tot = 0; SET @st = GETDATE()
-    WHILE @d > 0
-    BEGIN
-        DELETE TOP (@BatchSize) FROM RawProcess WHERE XDateInserted < @CutoffDate
-        SET @d = @@ROWCOUNT; SET @tot += @d
-        IF @d > 0 BEGIN CHECKPOINT; SET @sec = DATEDIFF(SECOND, @st, GETDATE()); SET @rate = CASE WHEN @sec > 0 THEN @tot / @sec ELSE 0 END
-            PRINT '  ' + CAST(@tot AS VARCHAR) + ' deleted | ' + CAST(@sec AS VARCHAR) + 's | ~' + CAST(@rate AS VARCHAR) + ' rows/sec'
-        END
-    END
-    PRINT '  Done: ' + CAST(@tot AS VARCHAR) + ' rows removed.'
-END
-
--- ────────────────────────────────────────────────────────────
--- 8. RawProcessGroup  (ExportDate)
--- ────────────────────────────────────────────────────────────
-IF OBJECT_ID('RawProcessGroup', 'U') IS NOT NULL
-BEGIN
-    PRINT 'Cleaning RawProcessGroup...'
-    SET @d = 1; SET @tot = 0; SET @st = GETDATE()
-    WHILE @d > 0
-    BEGIN
-        DELETE TOP (@BatchSize) FROM RawProcessGroup WHERE ExportDate < @CutoffDate
-        SET @d = @@ROWCOUNT; SET @tot += @d
-        IF @d > 0 BEGIN CHECKPOINT; SET @sec = DATEDIFF(SECOND, @st, GETDATE()); SET @rate = CASE WHEN @sec > 0 THEN @tot / @sec ELSE 0 END
-            PRINT '  ' + CAST(@tot AS VARCHAR) + ' deleted | ' + CAST(@sec AS VARCHAR) + 's | ~' + CAST(@rate AS VARCHAR) + ' rows/sec'
-        END
-    END
-    PRINT '  Done: ' + CAST(@tot AS VARCHAR) + ' rows removed.'
-END
-
--- ────────────────────────────────────────────────────────────
--- 9. WatchProperty  (FK join → WatchOperation.OperationDate)
+-- 1. WatchProperty  (FK join → WatchOperation.OperationDate)
 -- ────────────────────────────────────────────────────────────
 IF OBJECT_ID('WatchProperty', 'U') IS NOT NULL
 BEGIN
@@ -264,7 +110,7 @@ BEGIN
 END
 
 -- ────────────────────────────────────────────────────────────
--- 10. WatchOperation  (OperationDate)
+-- 2. WatchOperation  (OperationDate)
 -- ────────────────────────────────────────────────────────────
 IF OBJECT_ID('WatchOperation', 'U') IS NOT NULL
 BEGIN
@@ -282,7 +128,7 @@ BEGIN
 END
 
 -- ────────────────────────────────────────────────────────────
--- 11. ProcessStep  (ThisDate)
+-- 3. ProcessStep  (ThisDate)
 -- ────────────────────────────────────────────────────────────
 IF OBJECT_ID('ProcessStep', 'U') IS NOT NULL
 BEGIN
@@ -300,7 +146,7 @@ BEGIN
 END
 
 -- ────────────────────────────────────────────────────────────
--- 12. ProcessSubstitute  (FK join → ProcessInfo.FirstDate)
+-- 4. ProcessSubstitute  (FK join → ProcessInfo.FirstDate)
 -- ────────────────────────────────────────────────────────────
 IF OBJECT_ID('ProcessSubstitute', 'U') IS NOT NULL
 BEGIN
@@ -321,7 +167,7 @@ BEGIN
 END
 
 -- ────────────────────────────────────────────────────────────
--- 13. ProcessChain  (ThisDate)
+-- 5. ProcessChain  (ThisDate)
 -- ────────────────────────────────────────────────────────────
 IF OBJECT_ID('ProcessChain', 'U') IS NOT NULL
 BEGIN
@@ -339,7 +185,7 @@ BEGIN
 END
 
 -- ────────────────────────────────────────────────────────────
--- 14. HistoryJob  (StartAt)
+-- 6. HistoryJob  (StartAt)
 -- ────────────────────────────────────────────────────────────
 IF OBJECT_ID('HistoryJob', 'U') IS NOT NULL
 BEGIN
@@ -357,7 +203,7 @@ BEGIN
 END
 
 -- ────────────────────────────────────────────────────────────
--- 15. HistoryChain  (FirstDate)
+-- 7. HistoryChain  (FirstDate)
 -- ────────────────────────────────────────────────────────────
 IF OBJECT_ID('HistoryChain', 'U') IS NOT NULL
 BEGIN
@@ -375,7 +221,7 @@ BEGIN
 END
 
 -- ────────────────────────────────────────────────────────────
--- 16. ProcessInfo  (FirstDate)
+-- 8. ProcessInfo  (FirstDate)
 -- ────────────────────────────────────────────────────────────
 IF OBJECT_ID('ProcessInfo', 'U') IS NOT NULL
 BEGIN
@@ -393,7 +239,7 @@ BEGIN
 END
 
 -- ────────────────────────────────────────────────────────────
--- 17. ProcessGroup  (FirstDate)
+-- 9. ProcessGroup  (FirstDate)
 -- ────────────────────────────────────────────────────────────
 IF OBJECT_ID('ProcessGroup', 'U') IS NOT NULL
 BEGIN
