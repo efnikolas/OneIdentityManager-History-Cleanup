@@ -186,32 +186,28 @@ TRUNCATE TABLE dbo.WatchOperation
 RAISERROR('Reloading WatchOperation keep rows (batched)...', 0, 1) WITH NOWAIT
 SET @st = GETDATE()
 DECLARE @reloadTotal BIGINT = 0
-DECLARE @reloadRc INT = 1
+DECLARE @reloadRc INT = 0
+
+-- Add identity column for deterministic range-based batching
+ALTER TABLE dbo.Keep_WatchOperation ADD _BatchID INT IDENTITY(1,1)
+DECLARE @maxIdWO INT = (SELECT MAX(_BatchID) FROM dbo.Keep_WatchOperation)
+DECLARE @loWO INT = 1
 
 IF EXISTS (SELECT 1 FROM sys.identity_columns WHERE object_id = OBJECT_ID('dbo.WatchOperation'))
     SET IDENTITY_INSERT dbo.WatchOperation ON
 
--- Add a temp rownum column to batch the reload
-IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.Keep_WatchOperation') AND name = '_RowFlag')
-    ALTER TABLE dbo.Keep_WatchOperation ADD _RowFlag BIT NOT NULL DEFAULT 0
-
-WHILE @reloadRc > 0
+WHILE @loWO <= @maxIdWO
 BEGIN
     SET @sql =
         'INSERT INTO dbo.WatchOperation (' + @WatchOperationCols + ')
-         SELECT TOP (' + CAST(@BatchSize AS VARCHAR) + ') ' + @WatchOperationCols + '
-         FROM dbo.Keep_WatchOperation WHERE _RowFlag = 0;'
+         SELECT ' + @WatchOperationCols + '
+         FROM dbo.Keep_WatchOperation
+         WHERE _BatchID BETWEEN ' + CAST(@loWO AS VARCHAR) + ' AND ' + CAST(@loWO + @BatchSize - 1 AS VARCHAR) + ';'
     EXEC sp_executesql @sql
     SET @reloadRc = @@ROWCOUNT
     SET @reloadTotal += @reloadRc
-
-    -- Mark inserted rows
-    SET @sql =
-        'UPDATE TOP (' + CAST(@BatchSize AS VARCHAR) + ') dbo.Keep_WatchOperation SET _RowFlag = 1 WHERE _RowFlag = 0;'
-    EXEC sp_executesql @sql
-
-    IF @reloadRc > 0
-        RAISERROR('  %I64d reloaded so far...', 0, 1, @reloadTotal) WITH NOWAIT
+    SET @loWO = @loWO + @BatchSize
+    RAISERROR('  %I64d reloaded so far...', 0, 1, @reloadTotal) WITH NOWAIT
 END
 
 IF EXISTS (SELECT 1 FROM sys.identity_columns WHERE object_id = OBJECT_ID('dbo.WatchOperation'))
@@ -230,30 +226,26 @@ EXEC sp_executesql @sql
 RAISERROR('Reloading WatchProperty keep rows (batched)...', 0, 1) WITH NOWAIT
 SET @st = GETDATE()
 SET @reloadTotal = 0
-SET @reloadRc = 1
+
+ALTER TABLE dbo.Keep_WatchProperty ADD _BatchID INT IDENTITY(1,1)
+DECLARE @maxIdWP INT = (SELECT MAX(_BatchID) FROM dbo.Keep_WatchProperty)
+DECLARE @loWP INT = 1
 
 IF EXISTS (SELECT 1 FROM sys.identity_columns WHERE object_id = OBJECT_ID('dbo.WatchProperty'))
     SET IDENTITY_INSERT dbo.WatchProperty ON
 
-IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.Keep_WatchProperty') AND name = '_RowFlag')
-    ALTER TABLE dbo.Keep_WatchProperty ADD _RowFlag BIT NOT NULL DEFAULT 0
-
-WHILE @reloadRc > 0
+WHILE @loWP <= @maxIdWP
 BEGIN
     SET @sql =
         'INSERT INTO dbo.WatchProperty (' + @WatchPropertyCols + ')
-         SELECT TOP (' + CAST(@BatchSize AS VARCHAR) + ') ' + @WatchPropertyCols + '
-         FROM dbo.Keep_WatchProperty WHERE _RowFlag = 0;'
+         SELECT ' + @WatchPropertyCols + '
+         FROM dbo.Keep_WatchProperty
+         WHERE _BatchID BETWEEN ' + CAST(@loWP AS VARCHAR) + ' AND ' + CAST(@loWP + @BatchSize - 1 AS VARCHAR) + ';'
     EXEC sp_executesql @sql
     SET @reloadRc = @@ROWCOUNT
     SET @reloadTotal += @reloadRc
-
-    SET @sql =
-        'UPDATE TOP (' + CAST(@BatchSize AS VARCHAR) + ') dbo.Keep_WatchProperty SET _RowFlag = 1 WHERE _RowFlag = 0;'
-    EXEC sp_executesql @sql
-
-    IF @reloadRc > 0
-        RAISERROR('  %I64d reloaded so far...', 0, 1, @reloadTotal) WITH NOWAIT
+    SET @loWP = @loWP + @BatchSize
+    RAISERROR('  %I64d reloaded so far...', 0, 1, @reloadTotal) WITH NOWAIT
 END
 
 IF EXISTS (SELECT 1 FROM sys.identity_columns WHERE object_id = OBJECT_ID('dbo.WatchProperty'))
