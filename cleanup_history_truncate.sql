@@ -16,10 +16,13 @@ GO
 
 DECLARE @CutoffDate DATETIME = DATEADD(YEAR, -2, GETDATE())
 DECLARE @BatchSize  INT      = 100000
+DECLARE @dbName    NVARCHAR(128) = DB_NAME()
+DECLARE @cutoffStr VARCHAR(30)   = CONVERT(VARCHAR, @CutoffDate, 120)
+DECLARE @sec       INT
 
 RAISERROR('================================================', 0, 1) WITH NOWAIT
-RAISERROR('HDB Cleanup - %s', 0, 1, DB_NAME()) WITH NOWAIT
-RAISERROR('Deleting everything before: %s', 0, 1, CONVERT(VARCHAR, @CutoffDate, 120)) WITH NOWAIT
+RAISERROR('HDB Cleanup - %s', 0, 1, @dbName) WITH NOWAIT
+RAISERROR('Deleting everything before: %s', 0, 1, @cutoffStr) WITH NOWAIT
 RAISERROR('Batch size: %d', 0, 1, @BatchSize) WITH NOWAIT
 RAISERROR('================================================', 0, 1) WITH NOWAIT
 
@@ -80,7 +83,8 @@ BEGIN
     IF @rc > 0
         RAISERROR('  %I64d so far...', 0, 1, @total) WITH NOWAIT
 END
-RAISERROR('  %I64d rows deleted (%ds)', 0, 1, @total, DATEDIFF(SECOND, @st, GETDATE())) WITH NOWAIT
+SET @sec = DATEDIFF(SECOND, @st, GETDATE())
+RAISERROR('  %I64d rows deleted (%ds)', 0, 1, @total, @sec) WITH NOWAIT
 
 -- 2. WatchOperation
 RAISERROR('WatchOperation...', 0, 1) WITH NOWAIT
@@ -93,7 +97,8 @@ BEGIN
     IF @rc > 0
         RAISERROR('  %I64d so far...', 0, 1, @total) WITH NOWAIT
 END
-RAISERROR('  %I64d rows deleted (%ds)', 0, 1, @total, DATEDIFF(SECOND, @st, GETDATE())) WITH NOWAIT
+SET @sec = DATEDIFF(SECOND, @st, GETDATE())
+RAISERROR('  %I64d rows deleted (%ds)', 0, 1, @total, @sec) WITH NOWAIT
 
 -- 3. ProcessStep
 RAISERROR('ProcessStep...', 0, 1) WITH NOWAIT
@@ -106,7 +111,8 @@ BEGIN
     IF @rc > 0
         RAISERROR('  %I64d so far...', 0, 1, @total) WITH NOWAIT
 END
-RAISERROR('  %I64d rows deleted (%ds)', 0, 1, @total, DATEDIFF(SECOND, @st, GETDATE())) WITH NOWAIT
+SET @sec = DATEDIFF(SECOND, @st, GETDATE())
+RAISERROR('  %I64d rows deleted (%ds)', 0, 1, @total, @sec) WITH NOWAIT
 
 -- 4. ProcessSubstitute (child of ProcessInfo via FK join)
 RAISERROR('ProcessSubstitute...', 0, 1) WITH NOWAIT
@@ -122,7 +128,8 @@ BEGIN
     IF @rc > 0
         RAISERROR('  %I64d so far...', 0, 1, @total) WITH NOWAIT
 END
-RAISERROR('  %I64d rows deleted (%ds)', 0, 1, @total, DATEDIFF(SECOND, @st, GETDATE())) WITH NOWAIT
+SET @sec = DATEDIFF(SECOND, @st, GETDATE())
+RAISERROR('  %I64d rows deleted (%ds)', 0, 1, @total, @sec) WITH NOWAIT
 
 -- 5. ProcessChain
 RAISERROR('ProcessChain...', 0, 1) WITH NOWAIT
@@ -135,7 +142,8 @@ BEGIN
     IF @rc > 0
         RAISERROR('  %I64d so far...', 0, 1, @total) WITH NOWAIT
 END
-RAISERROR('  %I64d rows deleted (%ds)', 0, 1, @total, DATEDIFF(SECOND, @st, GETDATE())) WITH NOWAIT
+SET @sec = DATEDIFF(SECOND, @st, GETDATE())
+RAISERROR('  %I64d rows deleted (%ds)', 0, 1, @total, @sec) WITH NOWAIT
 
 -- 6. HistoryJob
 RAISERROR('HistoryJob...', 0, 1) WITH NOWAIT
@@ -148,7 +156,8 @@ BEGIN
     IF @rc > 0
         RAISERROR('  %I64d so far...', 0, 1, @total) WITH NOWAIT
 END
-RAISERROR('  %I64d rows deleted (%ds)', 0, 1, @total, DATEDIFF(SECOND, @st, GETDATE())) WITH NOWAIT
+SET @sec = DATEDIFF(SECOND, @st, GETDATE())
+RAISERROR('  %I64d rows deleted (%ds)', 0, 1, @total, @sec) WITH NOWAIT
 
 -- 7. HistoryChain
 RAISERROR('HistoryChain...', 0, 1) WITH NOWAIT
@@ -161,7 +170,8 @@ BEGIN
     IF @rc > 0
         RAISERROR('  %I64d so far...', 0, 1, @total) WITH NOWAIT
 END
-RAISERROR('  %I64d rows deleted (%ds)', 0, 1, @total, DATEDIFF(SECOND, @st, GETDATE())) WITH NOWAIT
+SET @sec = DATEDIFF(SECOND, @st, GETDATE())
+RAISERROR('  %I64d rows deleted (%ds)', 0, 1, @total, @sec) WITH NOWAIT
 
 -- 8. ProcessInfo
 RAISERROR('ProcessInfo...', 0, 1) WITH NOWAIT
@@ -174,7 +184,8 @@ BEGIN
     IF @rc > 0
         RAISERROR('  %I64d so far...', 0, 1, @total) WITH NOWAIT
 END
-RAISERROR('  %I64d rows deleted (%ds)', 0, 1, @total, DATEDIFF(SECOND, @st, GETDATE())) WITH NOWAIT
+SET @sec = DATEDIFF(SECOND, @st, GETDATE())
+RAISERROR('  %I64d rows deleted (%ds)', 0, 1, @total, @sec) WITH NOWAIT
 
 -- 9. ProcessGroup
 RAISERROR('ProcessGroup...', 0, 1) WITH NOWAIT
@@ -187,7 +198,8 @@ BEGIN
     IF @rc > 0
         RAISERROR('  %I64d so far...', 0, 1, @total) WITH NOWAIT
 END
-RAISERROR('  %I64d rows deleted (%ds)', 0, 1, @total, DATEDIFF(SECOND, @st, GETDATE())) WITH NOWAIT
+SET @sec = DATEDIFF(SECOND, @st, GETDATE())
+RAISERROR('  %I64d rows deleted (%ds)', 0, 1, @total, @sec) WITH NOWAIT
 
 RAISERROR('================================================', 0, 1) WITH NOWAIT
 RAISERROR('Done.', 0, 1) WITH NOWAIT
