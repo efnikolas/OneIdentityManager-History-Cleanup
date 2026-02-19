@@ -36,7 +36,11 @@ param(
 
     [int]$RetentionYears = 2,
 
-    [int]$BatchSize = 10000,
+    [int]$BatchSize = 50000,
+
+    [int]$BatchDelaySec = 0,
+
+    [switch]$CreateTempIndexes,
 
     [switch]$Encrypt,
 
@@ -131,6 +135,8 @@ Write-Log "Server:      $SqlServer"
 Write-Log "Databases:   $($Database -join ', ')"
 Write-Log "Cutoff:      $CutoffDate (retain last $RetentionYears years)"
 Write-Log "BatchSize:   $BatchSize"
+Write-Log "BatchDelay:  ${BatchDelaySec}s"
+Write-Log "TempIndexes: $CreateTempIndexes"
 Write-Log "Encrypt:     $Encrypt"
 Write-Log "TrustCert:   $TrustServerCertificate"
 Write-Log "WhatIf:      $WhatIf"
@@ -269,6 +275,38 @@ foreach ($db in $Database) {
         continue
     }
 
+    # ── Create temp indexes on date columns to speed up deletes ──
+    $tempIndexes = @()
+    if ($CreateTempIndexes) {
+        Write-Log "" "White"
+        Write-Log "  Creating temp indexes on date columns..." "Cyan"
+        foreach ($row in $tableInfo) {
+            $tbl = $row.TableName
+            $col = $row.DateColumn
+            $idxName = "IX_Cleanup_${tbl}_${col}"
+            try {
+                $idxCheckQuery = "SELECT CASE WHEN EXISTS ( " +
+                    "SELECT 1 FROM sys.index_columns ic " +
+                    "INNER JOIN sys.indexes i ON ic.object_id = i.object_id AND ic.index_id = i.index_id " +
+                    "WHERE ic.object_id = OBJECT_ID('$tbl') " +
+                    "AND ic.column_id = (SELECT column_id FROM sys.columns WHERE object_id = OBJECT_ID('$tbl') AND name = '$col') " +
+                    "AND ic.key_ordinal = 1) THEN 1 ELSE 0 END AS HasIndex"
+                $idxResult = Invoke-Sqlcmd @connParams -Database $db -Query $idxCheckQuery
+                if ($idxResult.HasIndex -eq 0) {
+                    $createIdxQuery = "CREATE NONCLUSTERED INDEX [$idxName] ON [$tbl] ([$col])"
+                    Invoke-Sqlcmd @connParams -Database $db -Query $createIdxQuery -QueryTimeout 600
+                    $tempIndexes += @{ IndexName = $idxName; TableName = $tbl }
+                    Write-Log "    OK Created $idxName" "DarkCyan"
+                } else {
+                    Write-Log "    SKIP $tbl.$col already indexed" "DarkGray"
+                }
+            }
+            catch {
+                Write-Log "    WARN Could not create index on $tbl.$col : $($_.Exception.Message)" "Yellow"
+            }
+        }
+    }
+
     # Delete in FK-safe order
     Write-Log "" "White"
     Write-Log "  Deleting..." "White"
@@ -297,31 +335,40 @@ foreach ($db in $Database) {
             if ($isFkJoin -and $fkJoinDeletes[$tbl].ParentDateCol) {
                 # ── FK-join delete (no date column on this table) ──
                 $fk = $fkJoinDeletes[$tbl]
+                $sw = [System.Diagnostics.Stopwatch]::StartNew()
                 do {
                     $deleteQuery = "SET NOCOUNT ON; " +
                         "DELETE TOP ($BatchSize) child FROM [$tbl] child " +
                         "INNER JOIN [$($fk.ParentTable)] parent " +
                         "ON child.[$($fk.ChildFK)] = parent.[$($fk.ParentPK)] " +
                         "WHERE parent.[$($fk.ParentDateCol)] < '$cutoffStr'; " +
+                        "CHECKPOINT; " +
                         "SELECT @@ROWCOUNT AS Deleted;"
                     $delResult = Invoke-Sqlcmd @connParams -Database $db -Query $deleteQuery
                     $deleted = $delResult.Deleted
                     $totalDeleted += $deleted
                     if ($deleted -gt 0) {
-                        Write-Log "    $tbl : deleted batch of $deleted ($totalDeleted total) [FK join -> $($fk.ParentTable)]" "DarkGray"
+                        $elapsed = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+                        $rate = if ($elapsed -gt 0) { [math]::Round($totalDeleted / $elapsed) } else { 0 }
+                        Write-Log "    $tbl : batch $deleted ($totalDeleted total) | ${elapsed}s | ~${rate} rows/sec [FK join]" "DarkGray"
+                        if ($BatchDelaySec -gt 0) { Start-Sleep -Seconds $BatchDelaySec }
                     }
                 } while ($deleted -eq $BatchSize)
             }
             elseif ($hasDateCol) {
                 # ── Direct date-column delete ──
                 $col = $dateColumns[$tbl]
+                $sw = [System.Diagnostics.Stopwatch]::StartNew()
                 do {
-                    $deleteQuery = "SET NOCOUNT ON; DELETE TOP ($BatchSize) FROM [$tbl] WHERE [$col] < '$cutoffStr'; SELECT @@ROWCOUNT AS Deleted;"
+                    $deleteQuery = "SET NOCOUNT ON; DELETE TOP ($BatchSize) FROM [$tbl] WHERE [$col] < '$cutoffStr'; CHECKPOINT; SELECT @@ROWCOUNT AS Deleted;"
                     $delResult = Invoke-Sqlcmd @connParams -Database $db -Query $deleteQuery
                     $deleted = $delResult.Deleted
                     $totalDeleted += $deleted
                     if ($deleted -gt 0) {
-                        Write-Log "    $tbl : deleted batch of $deleted ($totalDeleted total)" "DarkGray"
+                        $elapsed = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+                        $rate = if ($elapsed -gt 0) { [math]::Round($totalDeleted / $elapsed) } else { 0 }
+                        Write-Log "    $tbl : batch $deleted ($totalDeleted total) | ${elapsed}s | ~${rate} rows/sec" "DarkGray"
+                        if ($BatchDelaySec -gt 0) { Start-Sleep -Seconds $BatchDelaySec }
                     }
                 } while ($deleted -eq $BatchSize)
             }
@@ -340,6 +387,21 @@ foreach ($db in $Database) {
         }
         catch {
             Write-Log "  ERROR $tbl : $($_.Exception.Message)" "Red"
+        }
+    }
+
+    # Post-cleanup: drop temp indexes
+    if ($tempIndexes.Count -gt 0) {
+        Write-Log "" "White"
+        Write-Log "  Dropping temp indexes..." "Cyan"
+        foreach ($idx in $tempIndexes) {
+            try {
+                Invoke-Sqlcmd @connParams -Database $db -Query "DROP INDEX [$($idx.IndexName)] ON [$($idx.TableName)]"
+                Write-Log "    Dropped $($idx.IndexName)" "DarkGray"
+            }
+            catch {
+                Write-Log "    WARN Could not drop $($idx.IndexName): $($_.Exception.Message)" "Yellow"
+            }
         }
     }
 

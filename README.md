@@ -95,7 +95,16 @@ $hdbs = (Invoke-Sqlcmd -ServerInstance "myserver" -Query "SELECT name FROM sys.d
 .\Invoke-OIMHistoryCleanup.ps1 -SqlServer "myserver" -Database "OneIMHDB","OneIMHDB2" -RetentionYears 3
 
 # Custom batch size
-.\Invoke-OIMHistoryCleanup.ps1 -SqlServer "myserver" -Database "OneIMHDB" -BatchSize 5000
+.\Invoke-OIMHistoryCleanup.ps1 -SqlServer "myserver" -Database "OneIMHDB" -BatchSize 100000
+
+# Create temp indexes on date columns for faster deletes (recommended for large HDBs)
+.\Invoke-OIMHistoryCleanup.ps1 -SqlServer "myserver" -Database "OneIMHDB" -CreateTempIndexes
+
+# Throttle deletes with a 2-second pause between batches (reduce I/O pressure)
+.\Invoke-OIMHistoryCleanup.ps1 -SqlServer "myserver" -Database "OneIMHDB" -BatchDelaySec 2
+
+# Full recommended invocation for large HDBs (millions of rows)
+.\Invoke-OIMHistoryCleanup.ps1 -SqlServer "myserver" -Database "OneIMHDB" -BatchSize 100000 -CreateTempIndexes
 ```
 
 ### Schema Discovery
@@ -150,8 +159,33 @@ The test scripts let you safely validate the cleanup against a **real History Da
 
 1. **Dynamic date column discovery** — each table is scanned for datetime columns, preferring `OperationDate` > `FirstDate` > `XDateInserted` > `ThisDate` > `StartAt` > `ExportDate` > `XDateUpdated`
 2. **FK-safe delete order** — Raw child tables are deleted before their Aggregated parent tables
-3. **Batched deletes** — rows are deleted in configurable batches (default 10,000) with `CHECKPOINT` after each table to manage transaction log growth
-4. **Metadata protection** — `SourceColumn`, `SourceDatabase`, and `SourceTable` are never touched
+3. **Batched deletes** — rows are deleted in configurable batches (default 50,000) with `CHECKPOINT` after each batch to manage transaction log growth
+4. **Temp index creation** — optionally creates non-clustered indexes on date columns before deleting to avoid repeated table scans (critical for tables with tens of millions of rows)
+5. **Progress tracking** — each batch logs cumulative deletes, elapsed time, and throughput (rows/sec)
+6. **Metadata protection** — `SourceColumn`, `SourceDatabase`, and `SourceTable` are never touched
+
+## Performance Tuning
+
+For large HDBs (tens of millions of rows), the default settings may be slow. Key tuning options:
+
+| Parameter | SQL Script | PowerShell | Default | Recommendation for large HDBs |
+|-----------|-----------|------------|---------|-------------------------------|
+| Batch size | `@BatchSize` | `-BatchSize` | 50,000 | 50,000–100,000 |
+| Temp indexes | `@CreateTempIndexes` | `-CreateTempIndexes` | Off (SQL: On) | **On** — biggest single speedup |
+| Batch delay | `@BatchDelay` | `-BatchDelaySec` | 0 | 0–2s if log/IO is a concern |
+
+### Why temp indexes matter
+
+Without an index on the date column, each `DELETE TOP (N) WHERE date < cutoff` performs a **full table scan** to find qualifying rows. With 96M rows and 50K batches, that's ~1,920 table scans. A non-clustered index on the date column turns each scan into an **index seek** — typically 10–100× faster.
+
+The scripts create these indexes before deleting and drop them afterward to avoid permanent overhead.
+
+### Recovery model consideration
+
+If your HDB is in **Full** recovery model, the transaction log will grow rapidly during large deletes. Consider:
+- Switching to **Simple** recovery model during cleanup (`ALTER DATABASE [OneIMHDB] SET RECOVERY SIMPLE`)
+- Or ensuring frequent log backups are running
+- The scripts issue `CHECKPOINT` after each batch, which helps reclaim log space in Simple mode
 
 ## Compatibility
 

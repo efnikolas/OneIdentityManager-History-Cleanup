@@ -31,20 +31,27 @@
 USE [OneIMHDB]
 GO
 
+SET NOCOUNT ON
+GO
+
 -- ============================================================
 -- CONFIGURATION
 -- ============================================================
-DECLARE @CutoffDate DATETIME = DATEADD(YEAR, -2, GETDATE())
-DECLARE @BatchSize  INT      = 10000
-DECLARE @Deleted    INT
-DECLARE @WhatIf     BIT      = 0
-DECLARE @PreviewLimit INT    = 0  -- 0 = return all rows in WhatIf preview
+DECLARE @CutoffDate        DATETIME    = DATEADD(YEAR, -2, GETDATE())
+DECLARE @BatchSize         INT         = 50000           -- ↑ raised from 10K for throughput
+DECLARE @Deleted           INT
+DECLARE @WhatIf            BIT         = 0
+DECLARE @PreviewLimit      INT         = 0               -- 0 = return all rows in WhatIf preview
+DECLARE @BatchDelay        VARCHAR(12) = '00:00:00'      -- pause between batches (HH:MM:SS), e.g. '00:00:01'
+DECLARE @CreateTempIndexes BIT         = 1               -- create temp non-clustered indexes on date cols before delete
 
 PRINT '================================================'
 PRINT 'OIM History Database Cleanup'
 PRINT 'Database:    ' + DB_NAME()
 PRINT 'Cutoff date: ' + CONVERT(VARCHAR(20), @CutoffDate, 120)
 PRINT 'Batch size:  ' + CAST(@BatchSize AS VARCHAR)
+PRINT 'Batch delay: ' + @BatchDelay
+PRINT 'Temp indexes:' + CAST(@CreateTempIndexes AS VARCHAR)
 PRINT 'WhatIf:      ' + CAST(@WhatIf AS VARCHAR)
 PRINT 'PreviewLimit:' + CAST(@PreviewLimit AS VARCHAR)
 PRINT '================================================'
@@ -199,6 +206,57 @@ PRINT '# CLEANUP'
 PRINT '================================================'
 
 -- ============================================================
+-- HELPER: Create temp indexes on date columns to avoid
+-- repeated table scans during batched deletes.
+-- ============================================================
+DECLARE @IdxSQL NVARCHAR(MAX)
+DECLARE @TempIndexes TABLE (IndexName NVARCHAR(256), TableName NVARCHAR(256))
+
+IF @WhatIf = 0 AND @CreateTempIndexes = 1
+BEGIN
+    DECLARE idx_cur CURSOR LOCAL FAST_FORWARD FOR
+        SELECT TableName, DateColumn FROM @Tables
+
+    OPEN idx_cur
+    FETCH NEXT FROM idx_cur INTO @TableName, @DateCol
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        -- Only create if no existing index has this date column as leading key
+        IF NOT EXISTS (
+            SELECT 1 FROM sys.index_columns ic
+            INNER JOIN sys.indexes i ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+            WHERE ic.object_id = OBJECT_ID(@TableName)
+              AND ic.column_id = (
+                  SELECT column_id FROM sys.columns
+                  WHERE object_id = OBJECT_ID(@TableName) AND name = @DateCol
+              )
+              AND ic.key_ordinal = 1
+        )
+        BEGIN
+            DECLARE @IdxName NVARCHAR(256) = N'IX_Cleanup_' + @TableName + N'_' + @DateCol
+            PRINT '  Creating temp index ' + @IdxName + '...'
+            SET @IdxSQL = N'CREATE NONCLUSTERED INDEX [' + @IdxName + N'] ON [' + @TableName + N'] ([' + @DateCol + N'])'
+            BEGIN TRY
+                EXEC sp_executesql @IdxSQL
+                INSERT INTO @TempIndexes (IndexName, TableName) VALUES (@IdxName, @TableName)
+                PRINT '  OK ' + @IdxName
+            END TRY
+            BEGIN CATCH
+                PRINT '  WARN Could not create index ' + @IdxName + ': ' + ERROR_MESSAGE()
+            END CATCH
+        END
+        ELSE
+            PRINT '  Index already exists on ' + @TableName + '.' + @DateCol + ' -- skipping'
+
+        FETCH NEXT FROM idx_cur INTO @TableName, @DateCol
+    END
+    CLOSE idx_cur
+    DEALLOCATE idx_cur
+
+    PRINT ''
+END
+
+-- ============================================================
 -- DELETE in dependency-safe order
 -- Child tables (Raw*) before aggregated parent tables.
 -- WatchProperty before WatchOperation, etc.
@@ -330,6 +388,8 @@ BEGIN
         PRINT 'Cleaning ' + @TableName + ' (FK join -> ' + @FKParent + '.' + @FKDateCol + ' < cutoff)...'
         BEGIN TRY
             SET @Deleted = 1
+            DECLARE @FKTotalDeleted BIGINT = 0
+            DECLARE @FKStartTime   DATETIME = GETDATE()
             WHILE @Deleted > 0
             BEGIN
                 SET @SQL = N'DELETE TOP (' + CAST(@BatchSize AS NVARCHAR) + N') child FROM [' + @TableName + N'] child ' +
@@ -337,11 +397,21 @@ BEGIN
                     N'WHERE parent.[' + @FKDateCol + N'] < @cutoff'
                 EXEC sp_executesql @SQL, N'@cutoff DATETIME', @CutoffDate
                 SET @Deleted = @@ROWCOUNT
+                SET @FKTotalDeleted = @FKTotalDeleted + @Deleted
                 IF @Deleted > 0
-                    PRINT '  Deleted batch: ' + CAST(@Deleted AS VARCHAR)
+                BEGIN
+                    CHECKPOINT
+                    DECLARE @FKElapsedSec INT = DATEDIFF(SECOND, @FKStartTime, GETDATE())
+                    DECLARE @FKRate       BIGINT = CASE WHEN @FKElapsedSec > 0 THEN @FKTotalDeleted / @FKElapsedSec ELSE 0 END
+                    PRINT '  Deleted batch: ' + CAST(@Deleted AS VARCHAR) +
+                          ' | total: ' + CAST(@FKTotalDeleted AS VARCHAR) +
+                          ' | ' + CAST(@FKElapsedSec AS VARCHAR) + 's elapsed' +
+                          ' | ~' + CAST(@FKRate AS VARCHAR) + ' rows/sec'
+                    IF @BatchDelay <> '00:00:00'
+                        WAITFOR DELAY @BatchDelay
+                END
             END
-            CHECKPOINT
-            PRINT '  Done.'
+            PRINT '  Done. ' + CAST(@FKTotalDeleted AS VARCHAR) + ' rows removed.'
         END TRY
         BEGIN CATCH
             PRINT '  ERROR: ' + ERROR_MESSAGE()
@@ -353,16 +423,28 @@ BEGIN
         PRINT 'Cleaning ' + @TableName + ' (WHERE ' + @DateCol + ' < cutoff)...'
         BEGIN TRY
             SET @Deleted = 1
+            DECLARE @TotalDeleted BIGINT = 0
+            DECLARE @StartTime   DATETIME = GETDATE()
             WHILE @Deleted > 0
             BEGIN
                 SET @SQL = N'DELETE TOP (' + CAST(@BatchSize AS NVARCHAR) + N') FROM [' + @TableName + N'] WHERE [' + @DateCol + N'] < @cutoff'
                 EXEC sp_executesql @SQL, N'@cutoff DATETIME', @CutoffDate
                 SET @Deleted = @@ROWCOUNT
+                SET @TotalDeleted = @TotalDeleted + @Deleted
                 IF @Deleted > 0
-                    PRINT '  Deleted batch: ' + CAST(@Deleted AS VARCHAR)
+                BEGIN
+                    CHECKPOINT
+                    DECLARE @ElapsedSec INT  = DATEDIFF(SECOND, @StartTime, GETDATE())
+                    DECLARE @Rate       BIGINT = CASE WHEN @ElapsedSec > 0 THEN @TotalDeleted / @ElapsedSec ELSE 0 END
+                    PRINT '  Deleted batch: ' + CAST(@Deleted AS VARCHAR) +
+                          ' | total: ' + CAST(@TotalDeleted AS VARCHAR) +
+                          ' | ' + CAST(@ElapsedSec AS VARCHAR) + 's elapsed' +
+                          ' | ~' + CAST(@Rate AS VARCHAR) + ' rows/sec'
+                    IF @BatchDelay <> '00:00:00'
+                        WAITFOR DELAY @BatchDelay
+                END
             END
-            CHECKPOINT
-            PRINT '  Done.'
+            PRINT '  Done. ' + CAST(@TotalDeleted AS VARCHAR) + ' rows removed.'
         END TRY
         BEGIN CATCH
             PRINT '  ERROR: ' + ERROR_MESSAGE()
@@ -417,6 +499,30 @@ BEGIN
 END
 CLOSE fk_post
 DEALLOCATE fk_post
+
+-- ============================================================
+-- DROP TEMP INDEXES
+-- ============================================================
+DECLARE @DropIdx NVARCHAR(256)
+DECLARE @DropTbl NVARCHAR(256)
+DECLARE drop_cur CURSOR LOCAL FAST_FORWARD FOR
+    SELECT IndexName, TableName FROM @TempIndexes
+OPEN drop_cur
+FETCH NEXT FROM drop_cur INTO @DropIdx, @DropTbl
+WHILE @@FETCH_STATUS = 0
+BEGIN
+    BEGIN TRY
+        SET @SQL = N'DROP INDEX [' + @DropIdx + N'] ON [' + @DropTbl + N']'
+        EXEC sp_executesql @SQL
+        PRINT '  Dropped temp index ' + @DropIdx
+    END TRY
+    BEGIN CATCH
+        PRINT '  WARN Could not drop ' + @DropIdx + ': ' + ERROR_MESSAGE()
+    END CATCH
+    FETCH NEXT FROM drop_cur INTO @DropIdx, @DropTbl
+END
+CLOSE drop_cur
+DEALLOCATE drop_cur
 
 PRINT ''
 PRINT '================================================'
