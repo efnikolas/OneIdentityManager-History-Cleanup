@@ -441,14 +441,14 @@ BEGIN
 END
 PRINT ''
 
--- 14. HistoryJob (COALESCE(StartAt, ReadyAt))
+-- 14. HistoryJob (StartAt)
 IF OBJECT_ID('HistoryJob','U') IS NOT NULL
 BEGIN
     PRINT 'Cleaning HistoryJob...'
     SET @Total = 0  SET @Start = GETDATE()  SET @Deleted = 1
     WHILE @Deleted > 0
     BEGIN
-        DELETE TOP (@BatchSize) FROM HistoryJob WHERE COALESCE(StartAt, ReadyAt) < @CutoffDate
+        DELETE TOP (@BatchSize) FROM HistoryJob WHERE StartAt < @CutoffDate OR StartAt IS NULL
         SET @Deleted = @@ROWCOUNT
         SET @Total = @Total + @Deleted
         IF @Deleted > 0

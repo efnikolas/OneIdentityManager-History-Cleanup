@@ -252,7 +252,7 @@ BEGIN
 END
 
 -- ────────────────────────────────────────────────────────────
--- 6. HistoryJob  (COALESCE(StartAt, ReadyAt))
+-- 6. HistoryJob  (StartAt)
 -- ────────────────────────────────────────────────────────────
 IF OBJECT_ID('HistoryJob', 'U') IS NOT NULL
 BEGIN
@@ -261,8 +261,7 @@ BEGIN
     WHILE @d > 0
     BEGIN
         DELETE TOP (@BatchSize) FROM HistoryJob
-        WHERE COALESCE(StartAt, ReadyAt) < @CutoffDate
-              OR (StartAt IS NULL AND ReadyAt IS NULL)
+        WHERE StartAt < @CutoffDate OR StartAt IS NULL
         SET @d = @@ROWCOUNT; SET @tot += @d
         IF @d > 0 BEGIN CHECKPOINT; SET @sec = DATEDIFF(SECOND, @st, GETDATE()); SET @rate = CASE WHEN @sec > 0 THEN @tot / @sec ELSE 0 END
             RAISERROR('  %I64d deleted | %ds | ~%I64d rows/sec', 0, 1, @tot, @sec, @rate) WITH NOWAIT
