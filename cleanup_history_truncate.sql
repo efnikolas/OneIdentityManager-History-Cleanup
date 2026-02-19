@@ -15,7 +15,7 @@ SET NOCOUNT ON
 GO
 
 DECLARE @CutoffDate DATETIME = DATEADD(YEAR, -2, GETDATE())
-DECLARE @BatchSize  INT      = 100000
+DECLARE @BatchSize  INT      = 500000
 DECLARE @dbName    NVARCHAR(128) = DB_NAME()
 DECLARE @cutoffStr VARCHAR(30)   = CONVERT(VARCHAR, @CutoffDate, 120)
 DECLARE @sec       INT
@@ -60,60 +60,6 @@ END
 CLOSE idx_cur; DEALLOCATE idx_cur
 
 RAISERROR('Cleanup done.', 0, 1) WITH NOWAIT
-RAISERROR(' ', 0, 1) WITH NOWAIT
-
--- ============================================================
--- CREATE CLEANUP INDEXES (dramatically speeds up FK-join and date-scan deletes)
--- ============================================================
-RAISERROR('Creating cleanup indexes...', 0, 1) WITH NOWAIT
-
--- FK-join indexes (WatchProperty & ProcessSubstitute)
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Cleanup_WatchProp_FK')
-    CREATE NONCLUSTERED INDEX IX_Cleanup_WatchProp_FK ON WatchProperty (UID_DialogWatchOperation)
-RAISERROR('  IX_Cleanup_WatchProp_FK on WatchProperty', 0, 1) WITH NOWAIT
-
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Cleanup_WatchOp_Date')
-    CREATE NONCLUSTERED INDEX IX_Cleanup_WatchOp_Date ON WatchOperation (OperationDate) INCLUDE (UID_DialogWatchOperation)
-RAISERROR('  IX_Cleanup_WatchOp_Date on WatchOperation', 0, 1) WITH NOWAIT
-
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Cleanup_ProcSub_FK')
-    CREATE NONCLUSTERED INDEX IX_Cleanup_ProcSub_FK ON ProcessSubstitute (UID_ProcessInfoNew)
-RAISERROR('  IX_Cleanup_ProcSub_FK on ProcessSubstitute', 0, 1) WITH NOWAIT
-
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Cleanup_ProcInfo_Date')
-    CREATE NONCLUSTERED INDEX IX_Cleanup_ProcInfo_Date ON ProcessInfo (FirstDate) INCLUDE (UID_ProcessInfo)
-RAISERROR('  IX_Cleanup_ProcInfo_Date on ProcessInfo', 0, 1) WITH NOWAIT
-
--- Date column indexes (for direct date deletes)
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Cleanup_WatchOp_OpDate')
-    CREATE NONCLUSTERED INDEX IX_Cleanup_WatchOp_OpDate ON WatchOperation (OperationDate)
-RAISERROR('  IX_Cleanup_WatchOp_OpDate on WatchOperation', 0, 1) WITH NOWAIT
-
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Cleanup_ProcStep_Date')
-    CREATE NONCLUSTERED INDEX IX_Cleanup_ProcStep_Date ON ProcessStep (ThisDate)
-RAISERROR('  IX_Cleanup_ProcStep_Date on ProcessStep', 0, 1) WITH NOWAIT
-
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Cleanup_ProcChain_Date')
-    CREATE NONCLUSTERED INDEX IX_Cleanup_ProcChain_Date ON ProcessChain (ThisDate)
-RAISERROR('  IX_Cleanup_ProcChain_Date on ProcessChain', 0, 1) WITH NOWAIT
-
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Cleanup_HistJob_Date')
-    CREATE NONCLUSTERED INDEX IX_Cleanup_HistJob_Date ON HistoryJob (StartAt)
-RAISERROR('  IX_Cleanup_HistJob_Date on HistoryJob', 0, 1) WITH NOWAIT
-
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Cleanup_HistChain_Date')
-    CREATE NONCLUSTERED INDEX IX_Cleanup_HistChain_Date ON HistoryChain (FirstDate)
-RAISERROR('  IX_Cleanup_HistChain_Date on HistoryChain', 0, 1) WITH NOWAIT
-
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Cleanup_ProcInfo_FirstDate')
-    CREATE NONCLUSTERED INDEX IX_Cleanup_ProcInfo_FirstDate ON ProcessInfo (FirstDate)
-RAISERROR('  IX_Cleanup_ProcInfo_FirstDate on ProcessInfo', 0, 1) WITH NOWAIT
-
-IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_Cleanup_ProcGroup_Date')
-    CREATE NONCLUSTERED INDEX IX_Cleanup_ProcGroup_Date ON ProcessGroup (FirstDate)
-RAISERROR('  IX_Cleanup_ProcGroup_Date on ProcessGroup', 0, 1) WITH NOWAIT
-
-RAISERROR('Indexes created.', 0, 1) WITH NOWAIT
 RAISERROR(' ', 0, 1) WITH NOWAIT
 
 -- ============================================================
