@@ -230,27 +230,30 @@ foreach ($db in $Database) {
         }
     }
 
-    # Pre-flight counts — tables with their own date column
+    # Pre-flight counts — fast estimated row counts + date ranges (no full table scans)
     Write-Log "" "White"
-    Write-Log "  Pre-flight summary:" "Yellow"
+    Write-Log "  Pre-flight summary (estimated):" "Yellow"
     foreach ($row in $tableInfo) {
         $tbl = $row.TableName
         $col = $row.DateColumn
         try {
-            $countQuery = "SELECT COUNT(*) AS Total, ISNULL(SUM(CASE WHEN [$col] < '$cutoffStr' THEN 1 ELSE 0 END), 0) AS ToPurge FROM [$tbl]"
+            $countQuery = "SELECT " +
+                "(SELECT SUM(p.row_count) FROM sys.dm_db_partition_stats p WHERE p.object_id = OBJECT_ID('$tbl') AND p.index_id IN (0,1)) AS Total, " +
+                "CONVERT(VARCHAR(20), MIN([$col]), 120) AS MinDate, " +
+                "CONVERT(VARCHAR(20), MAX([$col]), 120) AS MaxDate " +
+                "FROM [$tbl]"
             $result = Invoke-Sqlcmd @connParams -Database $db -Query $countQuery
-            Write-Log "    $tbl : $($result.Total) total, $($result.ToPurge) to purge (by $col)" "Yellow"
+            Write-Log "    $tbl : ~$($result.Total) rows ($col`: $($result.MinDate) to $($result.MaxDate))" "Yellow"
         }
         catch {
             Write-Log "    $tbl : error counting — $($_.Exception.Message)" "Red"
         }
     }
 
-    # Pre-flight counts — FK-joined tables (no date column)
+    # Pre-flight counts — FK-joined tables (estimated row counts only, no joins)
     foreach ($childTbl in @($fkJoinDeletes.Keys)) {
         $fk = $fkJoinDeletes[$childTbl]
         if (-not $fk.ParentDateCol) { continue }
-        # Check if child table exists in this database
         try {
             $existsQuery = "SELECT OBJECT_ID('$childTbl', 'U') AS ObjId"
             $existsResult = Invoke-Sqlcmd @connParams -Database $db -Query $existsQuery
@@ -259,13 +262,11 @@ foreach ($db in $Database) {
         catch { continue }
 
         try {
-            $fkCountQuery = "SELECT " +
-                "(SELECT COUNT(*) FROM [$childTbl]) AS Total, " +
-                "(SELECT COUNT(*) FROM [$childTbl] child " +
-                "INNER JOIN [$($fk.ParentTable)] parent ON child.[$($fk.ChildFK)] = parent.[$($fk.ParentPK)] " +
-                "WHERE parent.[$($fk.ParentDateCol)] < '$cutoffStr') AS ToPurge"
+            $fkCountQuery = "SELECT SUM(p.row_count) AS Total " +
+                "FROM sys.dm_db_partition_stats p " +
+                "WHERE p.object_id = OBJECT_ID('$childTbl') AND p.index_id IN (0,1)"
             $fkResult = Invoke-Sqlcmd @connParams -Database $db -Query $fkCountQuery
-            Write-Log "    $childTbl : $($fkResult.Total) total, $($fkResult.ToPurge) to purge (via $($fk.ParentTable).$($fk.ParentDateCol))" "Yellow"
+            Write-Log "    $childTbl : ~$($fkResult.Total) rows (purge via $($fk.ParentTable).$($fk.ParentDateCol))" "Yellow"
         }
         catch {
             Write-Log "    $childTbl : error counting — $($_.Exception.Message)" "Red"

@@ -152,6 +152,8 @@ FROM @FKJoinDeletes fk
 INNER JOIN @Tables t ON fk.ParentTable = t.TableName
 
 -- Show pre-flight counts — tables with their own date column
+-- Uses sys.dm_db_partition_stats for instant row counts (no table scan)
+-- and MIN/MAX on date column for quick range check.
 DECLARE preflight_cur CURSOR LOCAL FAST_FORWARD FOR
     SELECT TableName, DateColumn FROM @Tables ORDER BY TableName
 
@@ -159,19 +161,27 @@ OPEN preflight_cur
 FETCH NEXT FROM preflight_cur INTO @TableName, @DateCol
 WHILE @@FETCH_STATUS = 0
 BEGIN
-    SET @SQL = N'SELECT @total = COUNT(*), @old = ISNULL(SUM(CASE WHEN [' + @DateCol + N'] < @cutoff THEN 1 ELSE 0 END), 0) FROM [' + @TableName + N']'
-    EXEC sp_executesql @SQL,
-        N'@cutoff DATETIME, @total BIGINT OUTPUT, @old BIGINT OUTPUT',
-        @CutoffDate, @RowCount OUTPUT, @PurgeCount OUTPUT
+    SET @SQL = N'SELECT @total = SUM(p.row_count) ' +
+        N'FROM sys.dm_db_partition_stats p ' +
+        N'WHERE p.object_id = OBJECT_ID(''' + @TableName + N''') AND p.index_id IN (0,1)'
+    EXEC sp_executesql @SQL, N'@total BIGINT OUTPUT', @RowCount OUTPUT
 
-    PRINT '  ' + @TableName + ': ' + CAST(@RowCount AS VARCHAR) + ' total, ' + CAST(@PurgeCount AS VARCHAR) + ' to purge (by ' + @DateCol + ')'
+    -- Quick MIN/MAX to show date range without full scan
+    DECLARE @MinDate VARCHAR(20) = '?', @MaxDate VARCHAR(20) = '?'
+    SET @SQL = N'SELECT @mn = CONVERT(VARCHAR(20), MIN([' + @DateCol + N']), 120), ' +
+        N'@mx = CONVERT(VARCHAR(20), MAX([' + @DateCol + N']), 120) FROM [' + @TableName + N']'
+    EXEC sp_executesql @SQL,
+        N'@mn VARCHAR(20) OUTPUT, @mx VARCHAR(20) OUTPUT',
+        @MinDate OUTPUT, @MaxDate OUTPUT
+
+    PRINT '  ' + @TableName + ': ~' + CAST(ISNULL(@RowCount, 0) AS VARCHAR) + ' rows (' + @DateCol + ': ' + ISNULL(@MinDate, '?') + ' to ' + ISNULL(@MaxDate, '?') + ')'
 
     FETCH NEXT FROM preflight_cur INTO @TableName, @DateCol
 END
 CLOSE preflight_cur
 DEALLOCATE preflight_cur
 
--- Show pre-flight counts — FK-joined tables (no date column)
+-- Show pre-flight counts — FK-joined tables (estimated row counts only)
 DECLARE @FKChild   NVARCHAR(256)
 DECLARE @FKParent  NVARCHAR(256)
 DECLARE @FKChildCol NVARCHAR(256)
@@ -188,14 +198,11 @@ WHILE @@FETCH_STATUS = 0
 BEGIN
     IF OBJECT_ID(@FKChild, 'U') IS NOT NULL
     BEGIN
-        SET @SQL = N'SELECT @total = (SELECT COUNT(*) FROM [' + @FKChild + N']), ' +
-            N'@old = (SELECT COUNT(*) FROM [' + @FKChild + N'] child ' +
-            N'INNER JOIN [' + @FKParent + N'] parent ON child.[' + @FKChildCol + N'] = parent.[' + @FKParentCol + N'] ' +
-            N'WHERE parent.[' + @FKDateCol + N'] < @cutoff)'
-        EXEC sp_executesql @SQL,
-            N'@cutoff DATETIME, @total BIGINT OUTPUT, @old BIGINT OUTPUT',
-            @CutoffDate, @RowCount OUTPUT, @PurgeCount OUTPUT
-        PRINT '  ' + @FKChild + ': ' + CAST(@RowCount AS VARCHAR) + ' total, ' + CAST(@PurgeCount AS VARCHAR) + ' to purge (via ' + @FKParent + '.' + @FKDateCol + ')'
+        SET @SQL = N'SELECT @total = SUM(p.row_count) ' +
+            N'FROM sys.dm_db_partition_stats p ' +
+            N'WHERE p.object_id = OBJECT_ID(''' + @FKChild + N''') AND p.index_id IN (0,1)'
+        EXEC sp_executesql @SQL, N'@total BIGINT OUTPUT', @RowCount OUTPUT
+        PRINT '  ' + @FKChild + ': ~' + CAST(ISNULL(@RowCount, 0) AS VARCHAR) + ' rows (purge via ' + @FKParent + '.' + @FKDateCol + ')'
     END
     FETCH NEXT FROM fk_pre INTO @FKChild, @FKParent, @FKChildCol, @FKParentCol, @FKDateCol
 END
