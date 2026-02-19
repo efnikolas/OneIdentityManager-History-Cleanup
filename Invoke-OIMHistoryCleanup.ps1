@@ -230,7 +230,39 @@ foreach ($db in $Database) {
         }
     }
 
-    # Pre-flight counts — fast estimated row counts + date ranges (no full table scans)
+    # ── Create temp indexes on date columns EARLY so pre-flight MIN/MAX, benchmark, and deletes all benefit ──
+    $tempIndexes = @()
+    if (-not $WhatIf -and $CreateTempIndexes) {
+        Write-Log "" "White"
+        Write-Log "  Creating temp indexes on date columns..." "Cyan"
+        foreach ($row in $tableInfo) {
+            $tbl = $row.TableName
+            $col = $row.DateColumn
+            $idxName = "IX_Cleanup_${tbl}_${col}"
+            try {
+                $idxCheckQuery = "SELECT CASE WHEN EXISTS ( " +
+                    "SELECT 1 FROM sys.index_columns ic " +
+                    "INNER JOIN sys.indexes i ON ic.object_id = i.object_id AND ic.index_id = i.index_id " +
+                    "WHERE ic.object_id = OBJECT_ID('$tbl') " +
+                    "AND ic.column_id = (SELECT column_id FROM sys.columns WHERE object_id = OBJECT_ID('$tbl') AND name = '$col') " +
+                    "AND ic.key_ordinal = 1) THEN 1 ELSE 0 END AS HasIndex"
+                $idxResult = Invoke-Sqlcmd @connParams -Database $db -Query $idxCheckQuery
+                if ($idxResult.HasIndex -eq 0) {
+                    $createIdxQuery = "CREATE NONCLUSTERED INDEX [$idxName] ON [$tbl] ([$col])"
+                    Invoke-Sqlcmd @connParams -Database $db -Query $createIdxQuery -QueryTimeout 600
+                    $tempIndexes += @{ IndexName = $idxName; TableName = $tbl }
+                    Write-Log "    OK Created $idxName" "DarkCyan"
+                } else {
+                    Write-Log "    SKIP $tbl.$col already indexed" "DarkGray"
+                }
+            }
+            catch {
+                Write-Log "    WARN Could not create index on $tbl.$col : $($_.Exception.Message)" "Yellow"
+            }
+        }
+    }
+
+    # Pre-flight counts — fast estimated row counts + date ranges (indexes now available for MIN/MAX)
     Write-Log "" "White"
     Write-Log "  Pre-flight summary (estimated):" "Yellow"
     foreach ($row in $tableInfo) {
@@ -279,38 +311,6 @@ foreach ($db in $Database) {
         continue
     }
 
-    # ── Create temp indexes on date columns to speed up deletes ──
-    $tempIndexes = @()
-    if ($CreateTempIndexes) {
-        Write-Log "" "White"
-        Write-Log "  Creating temp indexes on date columns..." "Cyan"
-        foreach ($row in $tableInfo) {
-            $tbl = $row.TableName
-            $col = $row.DateColumn
-            $idxName = "IX_Cleanup_${tbl}_${col}"
-            try {
-                $idxCheckQuery = "SELECT CASE WHEN EXISTS ( " +
-                    "SELECT 1 FROM sys.index_columns ic " +
-                    "INNER JOIN sys.indexes i ON ic.object_id = i.object_id AND ic.index_id = i.index_id " +
-                    "WHERE ic.object_id = OBJECT_ID('$tbl') " +
-                    "AND ic.column_id = (SELECT column_id FROM sys.columns WHERE object_id = OBJECT_ID('$tbl') AND name = '$col') " +
-                    "AND ic.key_ordinal = 1) THEN 1 ELSE 0 END AS HasIndex"
-                $idxResult = Invoke-Sqlcmd @connParams -Database $db -Query $idxCheckQuery
-                if ($idxResult.HasIndex -eq 0) {
-                    $createIdxQuery = "CREATE NONCLUSTERED INDEX [$idxName] ON [$tbl] ([$col])"
-                    Invoke-Sqlcmd @connParams -Database $db -Query $createIdxQuery -QueryTimeout 600
-                    $tempIndexes += @{ IndexName = $idxName; TableName = $tbl }
-                    Write-Log "    OK Created $idxName" "DarkCyan"
-                } else {
-                    Write-Log "    SKIP $tbl.$col already indexed" "DarkGray"
-                }
-            }
-            catch {
-                Write-Log "    WARN Could not create index on $tbl.$col : $($_.Exception.Message)" "Yellow"
-            }
-        }
-    }
-
     # ── Benchmark batch sizes on the largest table ──
     if ($BenchmarkBatchSize) {
         Write-Log "" "White"
@@ -334,7 +334,8 @@ foreach ($db in $Database) {
             $tbl = $row.TableName; $col = $row.DateColumn
             if ($tbl -notin $leafTables) { continue }  # skip parent tables
             try {
-                $cntResult = Invoke-Sqlcmd @connParams -Database $db -Query "SELECT COUNT(*) AS Cnt FROM [$tbl] WHERE [$col] < '$cutoffStr'"
+                # Use estimated row count from partition stats (instant, no scan)
+                $cntResult = Invoke-Sqlcmd @connParams -Database $db -Query "SELECT SUM(p.row_count) AS Cnt FROM sys.dm_db_partition_stats p WHERE p.object_id = OBJECT_ID('$tbl') AND p.index_id IN (0,1)"
                 if (-not $benchBest -or $cntResult.Cnt -gt $benchBest.PurgeCount) {
                     $benchBest = @{ TableName = $tbl; DateColumn = $col; PurgeCount = $cntResult.Cnt }
                 }
@@ -349,22 +350,21 @@ foreach ($db in $Database) {
             $testSizes = @(5000, 10000, 25000, 50000, 100000, 250000, 500000)
             $bestRate = 0
             $bestSize = $BatchSize
+            $benchRowsDeleted = 0  # track total deleted across all sizes
 
             foreach ($testSize in $testSizes) {
-                # Check if enough rows remain
-                try {
-                    $remResult = Invoke-Sqlcmd @connParams -Database $db -Query "SELECT COUNT(*) AS Cnt FROM [$($benchBest.TableName)] WHERE [$($benchBest.DateColumn)] < '$cutoffStr'"
-                    if ($remResult.Cnt -lt $testSize) {
-                        Write-Log ("  {0,7}: SKIP (only {1} rows remain)" -f $testSize, $remResult.Cnt) "DarkGray"
-                        continue
-                    }
-                } catch { continue }
+                # Skip if we've already deleted most rows (estimate remaining)
+                $estRemain = $benchBest.PurgeCount - $benchRowsDeleted
+                if ($estRemain -lt $testSize) {
+                    Write-Log ("  {0,7}: SKIP (~{1} rows remain)" -f $testSize, $estRemain) "DarkGray"
+                    continue
+                }
 
                 $sw = [System.Diagnostics.Stopwatch]::StartNew()
                 $trialTotal = 0
                 for ($trial = 0; $trial -lt 3; $trial++) {
                     try {
-                        $delQuery = "SET NOCOUNT ON; DELETE TOP ($testSize) FROM [$($benchBest.TableName)] WHERE [$($benchBest.DateColumn)] < '$cutoffStr'; CHECKPOINT; SELECT @@ROWCOUNT AS Deleted;"
+                        $delQuery = "SET NOCOUNT ON; DECLARE @d INT; DELETE TOP ($testSize) FROM [$($benchBest.TableName)] WHERE [$($benchBest.DateColumn)] < '$cutoffStr'; SET @d = @@ROWCOUNT; IF @d > 0 CHECKPOINT; SELECT @d AS Deleted;"
                         $delR = Invoke-Sqlcmd @connParams -Database $db -Query $delQuery
                         $trialTotal += $delR.Deleted
                         if ($delR.Deleted -eq 0) { break }
@@ -373,8 +373,9 @@ foreach ($db in $Database) {
                 $sw.Stop()
                 $elapsedMs = $sw.ElapsedMilliseconds
                 $rate = if ($elapsedMs -gt 0) { [math]::Round(($trialTotal * 1000) / $elapsedMs) } else { 0 }
+                $benchRowsDeleted += $trialTotal
 
-                $estRemaining = $benchBest.PurgeCount - $trialTotal
+                $estRemaining = $benchBest.PurgeCount - $benchRowsDeleted
                 $estStr = if ($rate -gt 0) {
                     $estSec = [math]::Round($estRemaining / $rate)
                     "{0}h {1}m" -f [math]::Floor($estSec / 3600), [math]::Floor(($estSec % 3600) / 60)
@@ -404,6 +405,8 @@ foreach ($db in $Database) {
     # Delete in FK-safe order
     Write-Log "" "White"
     Write-Log "  Deleting..." "White"
+
+    $cleanedTables = @()  # track tables that had rows purged
 
     foreach ($tbl in $deleteOrder) {
         # Determine delete strategy for this table
@@ -465,7 +468,7 @@ foreach ($db in $Database) {
                 $col = $dateColumns[$tbl]
                 $sw = [System.Diagnostics.Stopwatch]::StartNew()
                 do {
-                    $deleteQuery = "SET NOCOUNT ON; DELETE TOP ($BatchSize) FROM [$tbl] WHERE [$col] < '$cutoffStr'; CHECKPOINT; SELECT @@ROWCOUNT AS Deleted;"
+                    $deleteQuery = "SET NOCOUNT ON; DECLARE @d INT; DELETE TOP ($BatchSize) FROM [$tbl] WHERE [$col] < '$cutoffStr'; SET @d = @@ROWCOUNT; IF @d > 0 CHECKPOINT; SELECT @d AS Deleted;"
                     $delResult = Invoke-Sqlcmd @connParams -Database $db -Query $deleteQuery
                     $deleted = $delResult.Deleted
                     $totalDeleted += $deleted
@@ -485,6 +488,7 @@ foreach ($db in $Database) {
             if ($totalDeleted -gt 0) {
                 Write-Log "  OK $tbl : $totalDeleted rows purged" "Green"
                 $dbTotal += $totalDeleted
+                $cleanedTables += $tbl
             }
             else {
                 Write-Log "  OK $tbl : nothing to purge" "DarkGray"
@@ -510,16 +514,27 @@ foreach ($db in $Database) {
         }
     }
 
-    # Post-cleanup stats update
-    if ($dbTotal -gt 0) {
+    # Post-cleanup: targeted stats update only on cleaned tables (much faster than sp_updatestats)
+    if ($cleanedTables.Count -gt 0) {
         Write-Log "" "White"
-        Write-Log "  Updating statistics for $db..." "Cyan"
-        try {
-            Invoke-Sqlcmd @connParams -Database $db -Query "EXEC sp_updatestats"
-            Write-Log "  OK Statistics updated" "Green"
+        Write-Log "  Updating statistics on $($cleanedTables.Count) cleaned tables..." "Cyan"
+        foreach ($tbl in $cleanedTables) {
+            try {
+                Invoke-Sqlcmd @connParams -Database $db -Query "UPDATE STATISTICS [$tbl]" -QueryTimeout 300
+                Write-Log "    OK $tbl" "DarkGray"
+            }
+            catch {
+                Write-Log "    WARN $tbl : $($_.Exception.Message)" "Yellow"
+            }
         }
-        catch {
-            Write-Log "  ERROR sp_updatestats: $($_.Exception.Message)" "Red"
+        Write-Log "  OK Statistics updated" "Green"
+
+        # Recommend index rebuild for heavily deleted tables
+        Write-Log "" "White"
+        Write-Log "  TIP: After mass deletes, indexes may be fragmented." "Yellow"
+        Write-Log "  Consider running this during a maintenance window:" "Yellow"
+        foreach ($tbl in $cleanedTables) {
+            Write-Log "    ALTER INDEX ALL ON [$tbl] REBUILD;" "DarkCyan"
         }
     }
 

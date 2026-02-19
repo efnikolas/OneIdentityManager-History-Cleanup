@@ -28,7 +28,7 @@
 -- ============================================================
 
 -- CHANGE THIS to your actual History Database name
-USE [OneIMHDB]
+USE [OneIMHDB3]
 GO
 
 SET NOCOUNT ON
@@ -151,9 +151,64 @@ SET fk.ParentDateCol = t.DateColumn
 FROM @FKJoinDeletes fk
 INNER JOIN @Tables t ON fk.ParentTable = t.TableName
 
+-- ============================================================
+-- HELPER: Create temp indexes on date columns EARLY so that
+-- pre-flight MIN/MAX, benchmark, and batched deletes all
+-- benefit from indexed access instead of full table scans.
+-- ============================================================
+DECLARE @IdxSQL NVARCHAR(MAX)
+DECLARE @TempIndexes TABLE (IndexName NVARCHAR(256), TableName NVARCHAR(256))
+
+IF @WhatIf = 0 AND @CreateTempIndexes = 1
+BEGIN
+    PRINT '# TEMP INDEX CREATION'
+    PRINT '================================================'
+
+    DECLARE idx_cur CURSOR LOCAL FAST_FORWARD FOR
+        SELECT TableName, DateColumn FROM @Tables
+
+    OPEN idx_cur
+    FETCH NEXT FROM idx_cur INTO @TableName, @DateCol
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        -- Only create if no existing index has this date column as leading key
+        IF NOT EXISTS (
+            SELECT 1 FROM sys.index_columns ic
+            INNER JOIN sys.indexes i ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+            WHERE ic.object_id = OBJECT_ID(@TableName)
+              AND ic.column_id = (
+                  SELECT column_id FROM sys.columns
+                  WHERE object_id = OBJECT_ID(@TableName) AND name = @DateCol
+              )
+              AND ic.key_ordinal = 1
+        )
+        BEGIN
+            DECLARE @IdxName NVARCHAR(256) = N'IX_Cleanup_' + @TableName + N'_' + @DateCol
+            PRINT '  Creating temp index ' + @IdxName + '...'
+            SET @IdxSQL = N'CREATE NONCLUSTERED INDEX [' + @IdxName + N'] ON [' + @TableName + N'] ([' + @DateCol + N'])'
+            BEGIN TRY
+                EXEC sp_executesql @IdxSQL
+                INSERT INTO @TempIndexes (IndexName, TableName) VALUES (@IdxName, @TableName)
+                PRINT '  OK ' + @IdxName
+            END TRY
+            BEGIN CATCH
+                PRINT '  WARN Could not create index ' + @IdxName + ': ' + ERROR_MESSAGE()
+            END CATCH
+        END
+        ELSE
+            PRINT '  Index already exists on ' + @TableName + '.' + @DateCol + ' -- skipping'
+
+        FETCH NEXT FROM idx_cur INTO @TableName, @DateCol
+    END
+    CLOSE idx_cur
+    DEALLOCATE idx_cur
+
+    PRINT ''
+END
+
 -- Show pre-flight counts — tables with their own date column
 -- Uses sys.dm_db_partition_stats for instant row counts (no table scan)
--- and MIN/MAX on date column for quick range check.
+-- and MIN/MAX on date column (now index-backed if temp indexes were created).
 DECLARE preflight_cur CURSOR LOCAL FAST_FORWARD FOR
     SELECT TableName, DateColumn FROM @Tables ORDER BY TableName
 
@@ -166,7 +221,7 @@ BEGIN
         N'WHERE p.object_id = OBJECT_ID(''' + @TableName + N''') AND p.index_id IN (0,1)'
     EXEC sp_executesql @SQL, N'@total BIGINT OUTPUT', @RowCount OUTPUT
 
-    -- Quick MIN/MAX to show date range without full scan
+    -- Quick MIN/MAX to show date range (uses temp index if available)
     DECLARE @MinDate VARCHAR(20) = '?', @MaxDate VARCHAR(20) = '?'
     SET @SQL = N'SELECT @mn = CONVERT(VARCHAR(20), MIN([' + @DateCol + N']), 120), ' +
         N'@mx = CONVERT(VARCHAR(20), MAX([' + @DateCol + N']), 120) FROM [' + @TableName + N']'
@@ -231,6 +286,7 @@ BEGIN
 
     -- Find table with most rows to purge — must be a LEAF table
     -- (no FK references pointing TO it) to avoid constraint errors.
+    -- Uses estimated row counts from partition stats (instant, no scan).
     DECLARE @BenchCandidates TABLE (TableName NVARCHAR(256), DateColumn NVARCHAR(256), PurgeCount BIGINT)
     DECLARE @BenchTbl NVARCHAR(256), @BenchCol NVARCHAR(256)
     DECLARE @BenchCnt BIGINT
@@ -247,10 +303,11 @@ BEGIN
     FETCH NEXT FROM bench_disco INTO @BenchTbl, @BenchCol
     WHILE @@FETCH_STATUS = 0
     BEGIN
-        SET @BenchSQL = N'SELECT @cnt = COUNT(*) FROM [' + @BenchTbl + N'] WHERE [' + @BenchCol + N'] < @cutoff'
+        -- Use estimated row count (instant) as upper bound for purge candidates
+        SET @BenchSQL = N'SELECT @cnt = SUM(p.row_count) FROM sys.dm_db_partition_stats p WHERE p.object_id = OBJECT_ID(''' + @BenchTbl + N''') AND p.index_id IN (0,1)'
         SET @BenchCnt = 0
-        EXEC sp_executesql @BenchSQL, N'@cutoff DATETIME, @cnt BIGINT OUTPUT', @CutoffDate, @BenchCnt OUTPUT
-        INSERT INTO @BenchCandidates VALUES (@BenchTbl, @BenchCol, @BenchCnt)
+        EXEC sp_executesql @BenchSQL, N'@cnt BIGINT OUTPUT', @BenchCnt OUTPUT
+        INSERT INTO @BenchCandidates VALUES (@BenchTbl, @BenchCol, ISNULL(@BenchCnt, 0))
         FETCH NEXT FROM bench_disco INTO @BenchTbl, @BenchCol
     END
     CLOSE bench_disco
@@ -286,16 +343,13 @@ BEGIN
             SELECT TestSize FROM @TestSizes ORDER BY TestSize
         OPEN bench_cur
         FETCH NEXT FROM bench_cur INTO @TestSize
+        DECLARE @BenchRowsDeleted BIGINT = 0  -- track total deleted across all sizes
         WHILE @@FETCH_STATUS = 0
         BEGIN
-            -- Skip sizes larger than remaining rows
-            SET @BenchSQL = N'SELECT @cnt = COUNT(*) FROM [' + @BenchTable + N'] WHERE [' + @BenchDateCol + N'] < @cutoff'
-            SET @BenchCnt = 0
-            EXEC sp_executesql @BenchSQL, N'@cutoff DATETIME, @cnt BIGINT OUTPUT', @CutoffDate, @BenchCnt OUTPUT
-
-            IF @BenchCnt < @TestSize
+            -- Skip if we've already deleted most rows (estimate remaining)
+            IF (@BenchPurge - @BenchRowsDeleted) < @TestSize
             BEGIN
-                PRINT '  ' + CAST(@TestSize AS VARCHAR(10)) + ': SKIP (only ' + CAST(@BenchCnt AS VARCHAR) + ' rows remain)'
+                PRINT '  ' + CAST(@TestSize AS VARCHAR(10)) + ': SKIP (~' + CAST(@BenchPurge - @BenchRowsDeleted AS VARCHAR) + ' rows remain)'
                 FETCH NEXT FROM bench_cur INTO @TestSize
                 CONTINUE
             END
@@ -315,13 +369,15 @@ BEGIN
                 SET @Trial = @Trial + 1
             END
 
+            SET @BenchRowsDeleted = @BenchRowsDeleted + @TrialTotal
+
             SET @TrialMs = DATEDIFF(MILLISECOND, @TrialStart, GETDATE())
             SET @TrialRate = CASE WHEN @TrialMs > 0 THEN (@TrialTotal * 1000) / @TrialMs ELSE 0 END
 
             DECLARE @EstHours VARCHAR(20) = ''
             IF @TrialRate > 0
             BEGIN
-                DECLARE @EstSec BIGINT = (@BenchPurge - @TrialTotal) / @TrialRate
+                DECLARE @EstSec BIGINT = (@BenchPurge - @BenchRowsDeleted) / @TrialRate
                 SET @EstHours = CAST(@EstSec / 3600 AS VARCHAR) + 'h ' + CAST((@EstSec % 3600) / 60 AS VARCHAR) + 'm'
             END
 
@@ -357,57 +413,6 @@ BEGIN
         PRINT 'Using default @BatchSize = ' + CAST(@BatchSize AS VARCHAR)
         PRINT ''
     END
-END
-
--- ============================================================
--- HELPER: Create temp indexes on date columns to avoid
--- repeated table scans during batched deletes.
--- ============================================================
-DECLARE @IdxSQL NVARCHAR(MAX)
-DECLARE @TempIndexes TABLE (IndexName NVARCHAR(256), TableName NVARCHAR(256))
-
-IF @WhatIf = 0 AND @CreateTempIndexes = 1
-BEGIN
-    DECLARE idx_cur CURSOR LOCAL FAST_FORWARD FOR
-        SELECT TableName, DateColumn FROM @Tables
-
-    OPEN idx_cur
-    FETCH NEXT FROM idx_cur INTO @TableName, @DateCol
-    WHILE @@FETCH_STATUS = 0
-    BEGIN
-        -- Only create if no existing index has this date column as leading key
-        IF NOT EXISTS (
-            SELECT 1 FROM sys.index_columns ic
-            INNER JOIN sys.indexes i ON ic.object_id = i.object_id AND ic.index_id = i.index_id
-            WHERE ic.object_id = OBJECT_ID(@TableName)
-              AND ic.column_id = (
-                  SELECT column_id FROM sys.columns
-                  WHERE object_id = OBJECT_ID(@TableName) AND name = @DateCol
-              )
-              AND ic.key_ordinal = 1
-        )
-        BEGIN
-            DECLARE @IdxName NVARCHAR(256) = N'IX_Cleanup_' + @TableName + N'_' + @DateCol
-            PRINT '  Creating temp index ' + @IdxName + '...'
-            SET @IdxSQL = N'CREATE NONCLUSTERED INDEX [' + @IdxName + N'] ON [' + @TableName + N'] ([' + @DateCol + N'])'
-            BEGIN TRY
-                EXEC sp_executesql @IdxSQL
-                INSERT INTO @TempIndexes (IndexName, TableName) VALUES (@IdxName, @TableName)
-                PRINT '  OK ' + @IdxName
-            END TRY
-            BEGIN CATCH
-                PRINT '  WARN Could not create index ' + @IdxName + ': ' + ERROR_MESSAGE()
-            END CATCH
-        END
-        ELSE
-            PRINT '  Index already exists on ' + @TableName + '.' + @DateCol + ' -- skipping'
-
-        FETCH NEXT FROM idx_cur INTO @TableName, @DateCol
-    END
-    CLOSE idx_cur
-    DEALLOCATE idx_cur
-
-    PRINT ''
 END
 
 -- ============================================================
@@ -645,9 +650,9 @@ OPEN post_cur
 FETCH NEXT FROM post_cur INTO @TableName
 WHILE @@FETCH_STATUS = 0
 BEGIN
-    SET @SQL = N'SELECT @cnt = COUNT(*) FROM [' + @TableName + N']'
+    SET @SQL = N'SELECT @cnt = SUM(p.row_count) FROM sys.dm_db_partition_stats p WHERE p.object_id = OBJECT_ID(''' + @TableName + N''') AND p.index_id IN (0,1)'
     EXEC sp_executesql @SQL, N'@cnt BIGINT OUTPUT', @RowCount OUTPUT
-    PRINT '  ' + @TableName + ': ' + CAST(@RowCount AS VARCHAR) + ' rows remaining'
+    PRINT '  ' + @TableName + ': ~' + CAST(ISNULL(@RowCount, 0) AS VARCHAR) + ' rows remaining'
     FETCH NEXT FROM post_cur INTO @TableName
 END
 CLOSE post_cur
@@ -663,9 +668,9 @@ WHILE @@FETCH_STATUS = 0
 BEGIN
     IF OBJECT_ID(@FKChild, 'U') IS NOT NULL
     BEGIN
-        SET @SQL = N'SELECT @cnt = COUNT(*) FROM [' + @FKChild + N']'
+        SET @SQL = N'SELECT @cnt = SUM(p.row_count) FROM sys.dm_db_partition_stats p WHERE p.object_id = OBJECT_ID(''' + @FKChild + N''') AND p.index_id IN (0,1)'
         EXEC sp_executesql @SQL, N'@cnt BIGINT OUTPUT', @RowCount OUTPUT
-        PRINT '  ' + @FKChild + ': ' + CAST(@RowCount AS VARCHAR) + ' rows remaining (FK-joined)'
+        PRINT '  ' + @FKChild + ': ~' + CAST(ISNULL(@RowCount, 0) AS VARCHAR) + ' rows remaining (FK-joined)'
     END
     FETCH NEXT FROM fk_post INTO @FKChild
 END
@@ -698,7 +703,17 @@ DEALLOCATE drop_cur
 
 PRINT ''
 PRINT '================================================'
-PRINT 'Cleanup complete. Consider running:'
-PRINT '  EXEC sp_updatestats'
+PRINT 'Cleanup complete.'
+PRINT ''
+PRINT 'Recommended post-cleanup steps:'
+PRINT '  1. Update statistics on cleaned tables:'
+PRINT '     EXEC sp_updatestats'
+PRINT ''
+PRINT '  2. Rebuild indexes to reduce fragmentation'
+PRINT '     (run during a maintenance window):'
+PRINT '     EXEC sp_MSforeachtable ''ALTER INDEX ALL ON ? REBUILD'''
+PRINT ''
+PRINT '  3. If using FULL recovery model, back up the'
+PRINT '     transaction log to reclaim log space.'
 PRINT '================================================'
 GO
