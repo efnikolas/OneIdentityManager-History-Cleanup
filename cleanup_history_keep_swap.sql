@@ -67,6 +67,7 @@ DECLARE @rc INT
 
 DECLARE @WatchOperationCols NVARCHAR(MAX)
 DECLARE @WatchPropertyCols  NVARCHAR(MAX)
+DECLARE @WatchPropertyColsWp NVARCHAR(MAX)
 DECLARE @sql NVARCHAR(MAX)
 
 SELECT @WatchOperationCols = STRING_AGG(QUOTENAME(c.name), ',') WITHIN GROUP (ORDER BY c.column_id)
@@ -79,7 +80,12 @@ FROM sys.columns c
 WHERE c.object_id = OBJECT_ID('dbo.WatchProperty')
   AND c.is_computed = 0
 
-IF @WatchOperationCols IS NULL OR @WatchPropertyCols IS NULL
+SELECT @WatchPropertyColsWp = STRING_AGG('wp.' + QUOTENAME(c.name), ',') WITHIN GROUP (ORDER BY c.column_id)
+FROM sys.columns c
+WHERE c.object_id = OBJECT_ID('dbo.WatchProperty')
+    AND c.is_computed = 0
+
+IF @WatchOperationCols IS NULL OR @WatchPropertyCols IS NULL OR @WatchPropertyColsWp IS NULL
 BEGIN
     RAISERROR('WatchOperation/WatchProperty not found. Aborting.', 16, 1)
     RETURN
@@ -159,7 +165,7 @@ RAISERROR('Staging keep rows for WatchProperty...', 0, 1) WITH NOWAIT
 SET @st = GETDATE()
 
 SET @sql =
-    'SELECT ' + @WatchPropertyCols + '
+    'SELECT ' + @WatchPropertyColsWp + '
      INTO dbo.Keep_WatchProperty
      FROM dbo.WatchProperty wp
      INNER JOIN dbo.Keep_WatchOperation wo
@@ -177,22 +183,42 @@ RAISERROR('Dropping FK and truncating WatchOperation...', 0, 1) WITH NOWAIT
 EXEC sp_executesql @DropFKSql
 TRUNCATE TABLE dbo.WatchOperation
 
-RAISERROR('Reloading WatchOperation keep rows...', 0, 1) WITH NOWAIT
+RAISERROR('Reloading WatchOperation keep rows (batched)...', 0, 1) WITH NOWAIT
 SET @st = GETDATE()
+DECLARE @reloadTotal BIGINT = 0
+DECLARE @reloadRc INT = 1
 
 IF EXISTS (SELECT 1 FROM sys.identity_columns WHERE object_id = OBJECT_ID('dbo.WatchOperation'))
     SET IDENTITY_INSERT dbo.WatchOperation ON
 
-SET @sql =
-    'INSERT INTO dbo.WatchOperation (' + @WatchOperationCols + ')
-     SELECT ' + @WatchOperationCols + ' FROM dbo.Keep_WatchOperation;'
-EXEC sp_executesql @sql
+-- Add a temp rownum column to batch the reload
+IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.Keep_WatchOperation') AND name = '_RowFlag')
+    ALTER TABLE dbo.Keep_WatchOperation ADD _RowFlag BIT NOT NULL DEFAULT 0
+
+WHILE @reloadRc > 0
+BEGIN
+    SET @sql =
+        'INSERT INTO dbo.WatchOperation (' + @WatchOperationCols + ')
+         SELECT TOP (' + CAST(@BatchSize AS VARCHAR) + ') ' + @WatchOperationCols + '
+         FROM dbo.Keep_WatchOperation WHERE _RowFlag = 0;'
+    EXEC sp_executesql @sql
+    SET @reloadRc = @@ROWCOUNT
+    SET @reloadTotal += @reloadRc
+
+    -- Mark inserted rows
+    SET @sql =
+        'UPDATE TOP (' + CAST(@BatchSize AS VARCHAR) + ') dbo.Keep_WatchOperation SET _RowFlag = 1 WHERE _RowFlag = 0;'
+    EXEC sp_executesql @sql
+
+    IF @reloadRc > 0
+        RAISERROR('  %I64d reloaded so far...', 0, 1, @reloadTotal) WITH NOWAIT
+END
 
 IF EXISTS (SELECT 1 FROM sys.identity_columns WHERE object_id = OBJECT_ID('dbo.WatchOperation'))
     SET IDENTITY_INSERT dbo.WatchOperation OFF
 
 SET @sec = DATEDIFF(SECOND, @st, GETDATE())
-RAISERROR('  WatchOperation reloaded (%ds)', 0, 1, @sec) WITH NOWAIT
+RAISERROR('  WatchOperation reloaded: %I64d rows (%ds)', 0, 1, @reloadTotal, @sec) WITH NOWAIT
 
 RAISERROR('Recreating FK...', 0, 1) WITH NOWAIT
 EXEC sp_executesql @CreateFKSql
@@ -201,23 +227,58 @@ SET @sql =
     ' CHECK CONSTRAINT ' + QUOTENAME(@FKName)
 EXEC sp_executesql @sql
 
-RAISERROR('Reloading WatchProperty keep rows...', 0, 1) WITH NOWAIT
+RAISERROR('Reloading WatchProperty keep rows (batched)...', 0, 1) WITH NOWAIT
 SET @st = GETDATE()
+SET @reloadTotal = 0
+SET @reloadRc = 1
 
 IF EXISTS (SELECT 1 FROM sys.identity_columns WHERE object_id = OBJECT_ID('dbo.WatchProperty'))
     SET IDENTITY_INSERT dbo.WatchProperty ON
 
-SET @sql =
-    'INSERT INTO dbo.WatchProperty (' + @WatchPropertyCols + ')
-     SELECT ' + @WatchPropertyCols + ' FROM dbo.Keep_WatchProperty;'
-EXEC sp_executesql @sql
+IF NOT EXISTS (SELECT 1 FROM sys.columns WHERE object_id = OBJECT_ID('dbo.Keep_WatchProperty') AND name = '_RowFlag')
+    ALTER TABLE dbo.Keep_WatchProperty ADD _RowFlag BIT NOT NULL DEFAULT 0
+
+WHILE @reloadRc > 0
+BEGIN
+    SET @sql =
+        'INSERT INTO dbo.WatchProperty (' + @WatchPropertyCols + ')
+         SELECT TOP (' + CAST(@BatchSize AS VARCHAR) + ') ' + @WatchPropertyCols + '
+         FROM dbo.Keep_WatchProperty WHERE _RowFlag = 0;'
+    EXEC sp_executesql @sql
+    SET @reloadRc = @@ROWCOUNT
+    SET @reloadTotal += @reloadRc
+
+    SET @sql =
+        'UPDATE TOP (' + CAST(@BatchSize AS VARCHAR) + ') dbo.Keep_WatchProperty SET _RowFlag = 1 WHERE _RowFlag = 0;'
+    EXEC sp_executesql @sql
+
+    IF @reloadRc > 0
+        RAISERROR('  %I64d reloaded so far...', 0, 1, @reloadTotal) WITH NOWAIT
+END
 
 IF EXISTS (SELECT 1 FROM sys.identity_columns WHERE object_id = OBJECT_ID('dbo.WatchProperty'))
     SET IDENTITY_INSERT dbo.WatchProperty OFF
 
 SET @sec = DATEDIFF(SECOND, @st, GETDATE())
-RAISERROR('  WatchProperty reloaded (%ds)', 0, 1, @sec) WITH NOWAIT
+RAISERROR('  WatchProperty reloaded: %I64d rows (%ds)', 0, 1, @reloadTotal, @sec) WITH NOWAIT
 
+-- Crash safety: verify reload counts before dropping Keep tables
+DECLARE @finalWO BIGINT, @keepWO BIGINT
+DECLARE @finalWP BIGINT, @keepWP BIGINT
+SELECT @finalWO = COUNT_BIG(*) FROM dbo.WatchOperation
+SELECT @keepWO  = COUNT_BIG(*) FROM dbo.Keep_WatchOperation
+SELECT @finalWP = COUNT_BIG(*) FROM dbo.WatchProperty
+SELECT @keepWP  = COUNT_BIG(*) FROM dbo.Keep_WatchProperty
+
+IF @finalWO < @keepWO OR @finalWP < @keepWP
+BEGIN
+    RAISERROR('ERROR: Reload count mismatch! Keep tables preserved for manual recovery.', 16, 1) WITH NOWAIT
+    RAISERROR('  WatchOperation: reloaded=%I64d, keep=%I64d', 0, 1, @finalWO, @keepWO) WITH NOWAIT
+    RAISERROR('  WatchProperty:  reloaded=%I64d, keep=%I64d', 0, 1, @finalWP, @keepWP) WITH NOWAIT
+    RETURN
+END
+
+RAISERROR('  Reload verified. Dropping Keep tables...', 0, 1) WITH NOWAIT
 DROP TABLE dbo.Keep_WatchProperty
 DROP TABLE dbo.Keep_WatchOperation
 
