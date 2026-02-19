@@ -221,32 +221,28 @@ PRINT '================================================'
 -- ============================================================
 IF @WhatIf = 0 AND @BenchmarkBatchSize = 1
 BEGIN
-    -- Find the table with the most rows to purge (best sample)
     DECLARE @BenchTable   NVARCHAR(256)
     DECLARE @BenchDateCol NVARCHAR(256)
     DECLARE @BenchPurge   BIGINT
 
-    SELECT TOP 1 @BenchTable = t.TableName, @BenchDateCol = t.DateColumn
-    FROM @Tables t
-    CROSS APPLY (
-        SELECT COUNT(*) AS PurgeCount
-        FROM sys.objects o
-        WHERE o.object_id = OBJECT_ID(t.TableName)
-    ) x
-    ORDER BY t.TableName  -- placeholder; actual purge count below
-
-    -- Get actual purge count for the largest table
     DECLARE @BenchSQL NVARCHAR(MAX)
     DECLARE @BestRate BIGINT = 0
     DECLARE @BestSize INT   = @BatchSize
 
-    -- Find table with most rows to purge
+    -- Find table with most rows to purge — must be a LEAF table
+    -- (no FK references pointing TO it) to avoid constraint errors.
     DECLARE @BenchCandidates TABLE (TableName NVARCHAR(256), DateColumn NVARCHAR(256), PurgeCount BIGINT)
     DECLARE @BenchTbl NVARCHAR(256), @BenchCol NVARCHAR(256)
     DECLARE @BenchCnt BIGINT
 
     DECLARE bench_disco CURSOR LOCAL FAST_FORWARD FOR
-        SELECT TableName, DateColumn FROM @Tables
+        SELECT t.TableName, t.DateColumn
+        FROM @Tables t
+        WHERE NOT EXISTS (
+            -- Exclude tables referenced as parent by any FK constraint
+            SELECT 1 FROM sys.foreign_keys fk
+            WHERE fk.referenced_object_id = OBJECT_ID(t.TableName)
+        )
     OPEN bench_disco
     FETCH NEXT FROM bench_disco INTO @BenchTbl, @BenchCol
     WHILE @@FETCH_STATUS = 0

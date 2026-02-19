@@ -318,10 +318,21 @@ foreach ($db in $Database) {
         Write-Log "  BATCH SIZE BENCHMARK" "Cyan"
         Write-Log "  =============================================" "Cyan"
 
-        # Find the table with the most rows to purge
+        # Find the largest LEAF table (no FK references pointing to it) to avoid constraint errors
         $benchBest = $null
+        $leafQuery = "SELECT t.name AS TableName " +
+            "FROM sys.tables t " +
+            "WHERE NOT EXISTS (SELECT 1 FROM sys.foreign_keys fk WHERE fk.referenced_object_id = t.object_id) " +
+            "ORDER BY t.name"
+        $leafTables = @()
+        try {
+            $leafResults = Invoke-Sqlcmd @connParams -Database $db -Query $leafQuery
+            $leafTables = $leafResults | ForEach-Object { $_.TableName }
+        } catch { }
+
         foreach ($row in $tableInfo) {
             $tbl = $row.TableName; $col = $row.DateColumn
+            if ($tbl -notin $leafTables) { continue }  # skip parent tables
             try {
                 $cntResult = Invoke-Sqlcmd @connParams -Database $db -Query "SELECT COUNT(*) AS Cnt FROM [$tbl] WHERE [$col] < '$cutoffStr'"
                 if (-not $benchBest -or $cntResult.Cnt -gt $benchBest.PurgeCount) {
