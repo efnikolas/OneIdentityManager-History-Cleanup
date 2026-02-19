@@ -325,7 +325,7 @@ BEGIN
         PRINT 'Target table: ' + @BenchTable + ' (' + CAST(@BenchPurge AS VARCHAR) + ' rows to purge)'
         PRINT 'Date column:  ' + @BenchDateCol
         PRINT ''
-        PRINT 'Testing batch sizes (1 trial batch each, early exit)...'
+        PRINT 'Testing batch sizes (2 trial batches each, early exit)...'
         PRINT '------------------------------------------------'
 
         DECLARE @TestSizes TABLE (TestSize INT)
@@ -358,12 +358,18 @@ BEGIN
             SET @TrialTotal = 0
             SET @TrialStart = GETDATE()
 
-            -- Single trial batch (enough to measure; rows are deleted anyway)
-            SET @BenchSQL = N'DELETE TOP (' + CAST(@TestSize AS NVARCHAR) + N') FROM [' + @BenchTable + N'] WHERE [' + @BenchDateCol + N'] < @cutoff'
-            EXEC sp_executesql @BenchSQL, N'@cutoff DATETIME', @CutoffDate
-            SET @TrialDeleted = @@ROWCOUNT
-            SET @TrialTotal = @TrialDeleted
-            CHECKPOINT
+            -- Two trial batches per size
+            DECLARE @Trial INT = 0
+            WHILE @Trial < 2
+            BEGIN
+                SET @BenchSQL = N'DELETE TOP (' + CAST(@TestSize AS NVARCHAR) + N') FROM [' + @BenchTable + N'] WHERE [' + @BenchDateCol + N'] < @cutoff'
+                EXEC sp_executesql @BenchSQL, N'@cutoff DATETIME', @CutoffDate
+                SET @TrialDeleted = @@ROWCOUNT
+                SET @TrialTotal = @TrialTotal + @TrialDeleted
+                CHECKPOINT
+                IF @TrialDeleted = 0 BREAK
+                SET @Trial = @Trial + 1
+            END
 
             SET @BenchRowsDeleted = @BenchRowsDeleted + @TrialTotal
 

@@ -344,7 +344,7 @@ foreach ($db in $Database) {
 
         if ($benchBest -and $benchBest.PurgeCount -ge 100000) {
             Write-Log "  Target: $($benchBest.TableName) ($($benchBest.PurgeCount) rows to purge by $($benchBest.DateColumn))" "Cyan"
-            Write-Log "  Testing 1 trial batch per size (early exit)..." "White"
+            Write-Log "  Testing 2 trial batches per size (early exit)..." "White"
             Write-Log "  ------------------------------------------------" "White"
 
             $testSizes = @(10000, 50000, 100000, 250000, 500000)
@@ -363,12 +363,15 @@ foreach ($db in $Database) {
 
                 $sw = [System.Diagnostics.Stopwatch]::StartNew()
                 $trialTotal = 0
-                # Single trial batch (enough to measure; rows are deleted anyway)
-                try {
-                    $delQuery = "SET NOCOUNT ON; DECLARE @d INT; DELETE TOP ($testSize) FROM [$($benchBest.TableName)] WHERE [$($benchBest.DateColumn)] < '$cutoffStr'; SET @d = @@ROWCOUNT; IF @d > 0 CHECKPOINT; SELECT @d AS Deleted;"
-                    $delR = Invoke-Sqlcmd @connParams -Database $db -Query $delQuery
-                    $trialTotal = $delR.Deleted
-                } catch { }
+                # Two trial batches per size
+                for ($trial = 0; $trial -lt 2; $trial++) {
+                    try {
+                        $delQuery = "SET NOCOUNT ON; DECLARE @d INT; DELETE TOP ($testSize) FROM [$($benchBest.TableName)] WHERE [$($benchBest.DateColumn)] < '$cutoffStr'; SET @d = @@ROWCOUNT; IF @d > 0 CHECKPOINT; SELECT @d AS Deleted;"
+                        $delR = Invoke-Sqlcmd @connParams -Database $db -Query $delQuery
+                        $trialTotal += $delR.Deleted
+                        if ($delR.Deleted -eq 0) { break }
+                    } catch { break }
+                }
                 $sw.Stop()
                 $elapsedMs = $sw.ElapsedMilliseconds
                 $rate = if ($elapsedMs -gt 0) { [math]::Round(($trialTotal * 1000) / $elapsedMs) } else { 0 }
