@@ -325,14 +325,13 @@ BEGIN
         PRINT 'Target table: ' + @BenchTable + ' (' + CAST(@BenchPurge AS VARCHAR) + ' rows to purge)'
         PRINT 'Date column:  ' + @BenchDateCol
         PRINT ''
-        PRINT 'Testing batch sizes (3 trial batches each)...'
+        PRINT 'Testing batch sizes (1 trial batch each, early exit)...'
         PRINT '------------------------------------------------'
 
         DECLARE @TestSizes TABLE (TestSize INT)
-        INSERT INTO @TestSizes VALUES (5000),(10000),(25000),(50000),(100000),(250000),(500000)
+        INSERT INTO @TestSizes VALUES (10000),(50000),(100000),(250000),(500000)
 
         DECLARE @TestSize      INT
-        DECLARE @TrialBatches  INT = 3
         DECLARE @TrialDeleted  INT
         DECLARE @TrialTotal    BIGINT
         DECLARE @TrialStart    DATETIME
@@ -344,6 +343,8 @@ BEGIN
         OPEN bench_cur
         FETCH NEXT FROM bench_cur INTO @TestSize
         DECLARE @BenchRowsDeleted BIGINT = 0  -- track total deleted across all sizes
+        DECLARE @PrevRate BIGINT = 0           -- previous test's rate
+        DECLARE @Declines INT = 0              -- consecutive throughput declines
         WHILE @@FETCH_STATUS = 0
         BEGIN
             -- Skip if we've already deleted most rows (estimate remaining)
@@ -357,17 +358,12 @@ BEGIN
             SET @TrialTotal = 0
             SET @TrialStart = GETDATE()
 
-            DECLARE @Trial INT = 0
-            WHILE @Trial < @TrialBatches
-            BEGIN
-                SET @BenchSQL = N'DELETE TOP (' + CAST(@TestSize AS NVARCHAR) + N') FROM [' + @BenchTable + N'] WHERE [' + @BenchDateCol + N'] < @cutoff'
-                EXEC sp_executesql @BenchSQL, N'@cutoff DATETIME', @CutoffDate
-                SET @TrialDeleted = @@ROWCOUNT
-                SET @TrialTotal = @TrialTotal + @TrialDeleted
-                CHECKPOINT
-                IF @TrialDeleted = 0 BREAK
-                SET @Trial = @Trial + 1
-            END
+            -- Single trial batch (enough to measure; rows are deleted anyway)
+            SET @BenchSQL = N'DELETE TOP (' + CAST(@TestSize AS NVARCHAR) + N') FROM [' + @BenchTable + N'] WHERE [' + @BenchDateCol + N'] < @cutoff'
+            EXEC sp_executesql @BenchSQL, N'@cutoff DATETIME', @CutoffDate
+            SET @TrialDeleted = @@ROWCOUNT
+            SET @TrialTotal = @TrialDeleted
+            CHECKPOINT
 
             SET @BenchRowsDeleted = @BenchRowsDeleted + @TrialTotal
 
@@ -390,7 +386,18 @@ BEGIN
             BEGIN
                 SET @BestRate = @TrialRate
                 SET @BestSize = @TestSize
+                SET @Declines = 0
             END
+            ELSE
+            BEGIN
+                SET @Declines = @Declines + 1
+                IF @Declines >= 2
+                BEGIN
+                    PRINT '  (early exit — throughput declining)'
+                    BREAK
+                END
+            END
+            SET @PrevRate = @TrialRate
 
             FETCH NEXT FROM bench_cur INTO @TestSize
         END

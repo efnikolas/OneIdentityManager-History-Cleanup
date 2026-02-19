@@ -344,13 +344,14 @@ foreach ($db in $Database) {
 
         if ($benchBest -and $benchBest.PurgeCount -ge 100000) {
             Write-Log "  Target: $($benchBest.TableName) ($($benchBest.PurgeCount) rows to purge by $($benchBest.DateColumn))" "Cyan"
-            Write-Log "  Testing 3 trial batches per size..." "White"
+            Write-Log "  Testing 1 trial batch per size (early exit)..." "White"
             Write-Log "  ------------------------------------------------" "White"
 
-            $testSizes = @(5000, 10000, 25000, 50000, 100000, 250000, 500000)
+            $testSizes = @(10000, 50000, 100000, 250000, 500000)
             $bestRate = 0
             $bestSize = $BatchSize
             $benchRowsDeleted = 0  # track total deleted across all sizes
+            $declines = 0          # consecutive throughput declines
 
             foreach ($testSize in $testSizes) {
                 # Skip if we've already deleted most rows (estimate remaining)
@@ -362,14 +363,12 @@ foreach ($db in $Database) {
 
                 $sw = [System.Diagnostics.Stopwatch]::StartNew()
                 $trialTotal = 0
-                for ($trial = 0; $trial -lt 3; $trial++) {
-                    try {
-                        $delQuery = "SET NOCOUNT ON; DECLARE @d INT; DELETE TOP ($testSize) FROM [$($benchBest.TableName)] WHERE [$($benchBest.DateColumn)] < '$cutoffStr'; SET @d = @@ROWCOUNT; IF @d > 0 CHECKPOINT; SELECT @d AS Deleted;"
-                        $delR = Invoke-Sqlcmd @connParams -Database $db -Query $delQuery
-                        $trialTotal += $delR.Deleted
-                        if ($delR.Deleted -eq 0) { break }
-                    } catch { break }
-                }
+                # Single trial batch (enough to measure; rows are deleted anyway)
+                try {
+                    $delQuery = "SET NOCOUNT ON; DECLARE @d INT; DELETE TOP ($testSize) FROM [$($benchBest.TableName)] WHERE [$($benchBest.DateColumn)] < '$cutoffStr'; SET @d = @@ROWCOUNT; IF @d > 0 CHECKPOINT; SELECT @d AS Deleted;"
+                    $delR = Invoke-Sqlcmd @connParams -Database $db -Query $delQuery
+                    $trialTotal = $delR.Deleted
+                } catch { }
                 $sw.Stop()
                 $elapsedMs = $sw.ElapsedMilliseconds
                 $rate = if ($elapsedMs -gt 0) { [math]::Round(($trialTotal * 1000) / $elapsedMs) } else { 0 }
@@ -386,6 +385,14 @@ foreach ($db in $Database) {
                 if ($rate -gt $bestRate) {
                     $bestRate = $rate
                     $bestSize = $testSize
+                    $declines = 0
+                }
+                else {
+                    $declines++
+                    if ($declines -ge 2) {
+                        Write-Log "  (early exit — throughput declining)" "DarkGray"
+                        break
+                    }
                 }
             }
 
