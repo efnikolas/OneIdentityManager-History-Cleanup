@@ -13,7 +13,7 @@ SET NOCOUNT ON
 GO
 
 DECLARE @Cutoff    DATETIME = DATEADD(YEAR, -2, GETDATE())
-DECLARE @BatchSize INT      = 500000
+DECLARE @BatchSize INT      = 49999
 DECLARE @Deleted   INT      = 1
 DECLARE @Total     BIGINT   = 0
 DECLARE @Start     DATETIME = GETDATE()
@@ -56,7 +56,7 @@ WHERE object_id = OBJECT_ID('WatchProperty') AND index_id IN (0,1)
 PRINT ''
 RAISERROR('  Total deleted : %I64d', 0, 1, @Total) WITH NOWAIT
 RAISERROR('  Rows remaining: ~%I64d', 0, 1, @after) WITH NOWAIT
-RAISERROR('  Runtime       : %d sec (~%d min)', 0, 1, @Sec, @Sec / 60) WITH NOWAIT
+PRINT '  Runtime       : ' + CAST(@Sec AS VARCHAR(20)) + ' sec (~' + CAST(@Sec / 60 AS VARCHAR(20)) + ' min)'
 PRINT '============================================================'
 PRINT 'WatchProperty — Done.'
 GO
