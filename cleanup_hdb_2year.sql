@@ -10,13 +10,17 @@
 --          Rows with ANY date within the last 2 years are NEVER deleted.
 --
 -- Strategy:
+--   - Temporarily switches to SIMPLE recovery so CHECKPOINT actually
+--     truncates the log (prevents log file from eating all disk space)
 --   - Batched deletes (configurable batch size) to avoid log explosion
 --   - CHECKPOINT after each batch to keep log file manageable
 --   - FK-safe deletion order: children first, parents last
 --   - Fully resumable: rerun safely — already-deleted rows won't match
---   - Pre/post flight row counts for verification
+--   - Pre/post flight row counts + log file size monitoring
+--   - Restores original recovery model when done
 --
 -- IMPORTANT: BACKUP YOUR DATABASE BEFORE RUNNING THIS SCRIPT
+--            After completion, take a FULL BACKUP to restart log chain.
 -- ============================================================================
 
 ----------------------------------------------------------------------
@@ -26,6 +30,39 @@ USE [OneIMHDB3]          -- << Set your HDB database name
 GO
 SET NOCOUNT ON
 GO
+
+-- ================================================================
+-- STEP 0: Switch to SIMPLE recovery to prevent log bloat
+-- ================================================================
+-- Save original recovery model, then switch to SIMPLE.
+-- In SIMPLE mode, CHECKPOINT actually truncates the log.
+-- We restore the original model at the end of the script.
+DECLARE @OrigRecovery NVARCHAR(60)
+SELECT @OrigRecovery = recovery_model_desc
+FROM sys.databases WHERE name = DB_NAME()
+
+PRINT '# RECOVERY MODEL'
+PRINT '  Current: ' + @OrigRecovery
+
+IF @OrigRecovery <> 'SIMPLE'
+BEGIN
+    PRINT '  Switching to SIMPLE for cleanup (will restore to ' + @OrigRecovery + ' when done)...'
+    -- Use dynamic SQL because ALTER DATABASE doesn't accept variables
+    DECLARE @sql NVARCHAR(200) = 'ALTER DATABASE ' + QUOTENAME(DB_NAME()) + ' SET RECOVERY SIMPLE'
+    EXEC sp_executesql @sql
+    PRINT '  Switched to SIMPLE.'
+END
+ELSE
+    PRINT '  Already SIMPLE — no change needed.'
+
+-- Show log file size before we start
+PRINT ''
+PRINT '# LOG FILE SIZE (before cleanup)'
+SELECT
+    name            AS LogicalName,
+    size / 128      AS SizeMB,
+    FILEPROPERTY(name, 'SpaceUsed') / 128 AS UsedMB
+FROM sys.database_files WHERE type_desc = 'LOG'
 
 DECLARE @Cutoff   DATETIME = DATEADD(YEAR, -2, GETDATE())   -- 2 years ago
 DECLARE @BatchSize INT     = 500000                          -- rows per batch
@@ -37,12 +74,14 @@ DECLARE @Start     DATETIME
 DECLARE @Sec       INT
 DECLARE @ScriptStart DATETIME = GETDATE()
 
+PRINT ''
 PRINT '============================================================'
 PRINT ' HDB CLEANUP — Delete rows older than 2 years'
 PRINT '============================================================'
 PRINT ''
 PRINT ' Cutoff date : ' + CONVERT(VARCHAR(30), @Cutoff, 120)
 PRINT ' Batch size  : ' + CAST(@BatchSize AS VARCHAR(20))
+PRINT ' Recovery    : SIMPLE (log truncated on each CHECKPOINT)'
 PRINT ' Started at  : ' + CONVERT(VARCHAR(30), GETDATE(), 120)
 PRINT ''
 
@@ -399,11 +438,37 @@ BEGIN
 END
 CLOSE cur_post; DEALLOCATE cur_post
 
+-- ================================================================
+-- POST-CLEANUP: Log file size check
+-- ================================================================
+PRINT ''
+PRINT '# LOG FILE SIZE (after cleanup)'
+SELECT
+    name            AS LogicalName,
+    size / 128      AS SizeMB,
+    FILEPROPERTY(name, 'SpaceUsed') / 128 AS UsedMB
+FROM sys.database_files WHERE type_desc = 'LOG'
+
+-- ================================================================
+-- RESTORE ORIGINAL RECOVERY MODEL
+-- ================================================================
+IF @OrigRecovery <> 'SIMPLE'
+BEGIN
+    PRINT ''
+    PRINT 'Restoring recovery model to ' + @OrigRecovery + '...'
+    DECLARE @restoreSql NVARCHAR(200) = 'ALTER DATABASE ' + QUOTENAME(DB_NAME()) + ' SET RECOVERY ' + @OrigRecovery
+    EXEC sp_executesql @restoreSql
+    PRINT 'Recovery model restored.'
+END
+
 DECLARE @TotalSec INT = DATEDIFF(SECOND, @ScriptStart, GETDATE())
 PRINT ''
 PRINT '============================================================'
 RAISERROR(' Total runtime: %d seconds (~%d minutes)', 0, 1, @TotalSec, @TotalSec / 60) WITH NOWAIT
 PRINT ' Finished at  : ' + CONVERT(VARCHAR(30), GETDATE(), 120)
 PRINT '============================================================'
+PRINT ''
+PRINT ' IMPORTANT: Take a FULL BACKUP now to restart the log chain!'
+PRINT ''
 PRINT 'Done.'
 GO
